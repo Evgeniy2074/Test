@@ -12,7 +12,7 @@
             author: 'Evgeniy2074',
             description: 'Тестовый источник через GitHub Pages',
             type: 'video',
-            url: 'https://Evgeniy2074.github.io/test.js',
+            url: 'https://evgeniy2074.github.io/Test/test.js',
             status: true
         };
     }
