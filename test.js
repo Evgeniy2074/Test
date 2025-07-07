@@ -1,18 +1,14 @@
-// ==UserScript==
-// @name         MySource
-// @version      1.0
-// @description  Пример источника для Lampa
-// ==/UserScript==
-
 (function () {
+    'use strict';
+
     function manifest() {
         return {
             version: '1.0',
             name: 'MySource',
             author: 'Evgeniy2074',
-            description: 'Тестовый источник через GitHub Pages',
+            description: 'Источник через GitHub Pages',
             type: 'video',
-            url: 'https://evgeniy2074.github.io/Test/test.js',
+            url: 'https://evgeniy2074.github.io/myplugin_source.js',
             status: true
         };
     }
