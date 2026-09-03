@@ -1,2720 +1,4462 @@
-(function(){
-  if(window.__alcopacAuthGate) return;
-  window.__alcopacAuthGate=1;
-  var LS_TOK='lampac_auth_token';
-  var _srvHost='https://beta.l-vid.online';
-  var _lo=window.location.origin||'';
-  var origin=(_lo&&_lo!=='null'&&_lo.indexOf('http')===0&&_lo.indexOf('127.0.0.1')<0&&_lo.indexOf('localhost')<0)?_lo:_srvHost;
+/*!
+ * Netflix UI for Lampa  v1.0.0
+ * Backend: lampac-nextgen (https://github.com/lampac-nextgen/lampac)
+ * Build:   2026-09-03T11:31:45.004Z
+ *
+ * Установка: Lampa -> Настройки -> Расширения -> Добавить плагин
+ */
+(function () {
+    'use strict';
 
-  // --- Helpers ---
-  function getToken(){
-    // Check alpac_token first (our brand-scoped name, safe from third-party
-    // plugins overwriting), then fall back to legacy lampac_token.
-    try{
-      var ca=document.cookie.match(/(?:^|;\s*)alpac_token=([^;]*)/);
-      if(ca)return decodeURIComponent(ca[1]);
-      var cl=document.cookie.match(/(?:^|;\s*)lampac_token=([^;]*)/);
-      if(cl)return decodeURIComponent(cl[1]);
-    }catch(e){}
-    try{var v=localStorage.getItem(LS_TOK);if(v)return v;}catch(e){}
-    return '';
-  }
-  function saveToken(tok){
-    if(!tok)return;
-    // SameSite=None;Secure on HTTPS so the cookie is sent on cross-origin
-    // XHRs (lampa.mx → beta.l-vid.online scenario). HTTP installs fall
-    // back to Lax — None requires Secure which plain-HTTP can't provide.
-    var sas=(location.protocol==='https:'?';SameSite=None;Secure':';SameSite=Lax');
-    try{
-      document.cookie='lampac_token='+tok+';path=/;max-age=31536000'+sas;
-      document.cookie='alpac_token='+tok+';path=/;max-age=31536000'+sas;
-    }catch(e){}
-    try{localStorage.setItem(LS_TOK,tok);}catch(e){}
-  }
-  function clearToken(){
-    // Aggressively clear cookies for all possible domain variants — both
-    // namespaces (lampac_token + alpac_token) so a partial logout
-    // doesn't leave one side alive.
-    try{
-      ['lampac_token','alpac_token'].forEach(function(n){
-        document.cookie=n+'=;path=/;max-age=0';
-        var d=location.hostname;
-        document.cookie=n+'=;path=/;max-age=0;domain='+d;
-        document.cookie=n+'=;path=/;max-age=0;domain=.'+d;
-        var pts=d.split('.');if(pts.length>2)document.cookie=n+'=;path=/;max-age=0;domain=.'+pts.slice(-2).join('.');
-      });
-    }catch(e){}
-    try{localStorage.removeItem(LS_TOK);}catch(e){}
-  }
-  function getUID(){
-    try{var raw=localStorage.getItem('lampac_unic_id');if(raw){try{var p=JSON.parse(raw);if(typeof p==='string'&&p)return p;}catch(e){if(typeof raw==='string'&&raw)return raw;}}}catch(e){}
-    return '';
-  }
-  // ensureUID generates and persists a device UID when none exists yet —
-  // on an external Lampa (plugin added by URL) nothing else creates
-  // lampac_unic_id, and a recovery without uid authorizes the session but
-  // never binds the device (invisible in the bot, no uid-based recovery).
-  function ensureUID(){
-    var u=getUID();
-    if(u)return u;
-    u='';var abc='abcdefghijklmnopqrstuvwxyz0123456789';
-    for(var i=0;i<8;i++)u+=abc.charAt(Math.floor(Math.random()*abc.length));
-    try{localStorage.setItem('lampac_unic_id',u);}catch(e){}
-    try{localStorage.setItem('lampac_uid_backup',u);}catch(e){}
-    return u;
-  }
-  // CUB session token from Lampa's account storage — the longest-lived
-  // recovery anchor: the server links it to the account passively, and after
-  // a full wipe a fresh CUB login alone restores the binding.
-  function getCub(){
-    try{var a=JSON.parse(localStorage.getItem('account')||'{}');if(a&&typeof a.token==='string'&&a.token)return a.token;}catch(e){}
-    return '';
-  }
-
-  // --- FNV-1a hash (matches Go server) ---
-  function fnv1a(str){
-    var h=0x811c9dc5;
-    for(var i=0;i<str.length;i++){h^=str.charCodeAt(i);h=Math.imul(h,0x01000193);}
-    return (h>>>0).toString(16);
-  }
-
-  // --- Device Fingerprint (survives data clear) ---
-  function getFingerprint(cb){
-    var parts=[];
-    try{parts.push('ua:'+navigator.userAgent);}catch(e){}
-    try{parts.push('plt:'+navigator.platform);}catch(e){}
-    try{parts.push('lang:'+(navigator.language||navigator.userLanguage||''));}catch(e){}
-    try{parts.push('tz:'+Intl.DateTimeFormat().resolvedOptions().timeZone);}catch(e){}
-    try{parts.push('scr:'+screen.width+'x'+screen.height+'x'+screen.colorDepth);}catch(e){}
-    try{parts.push('dpr:'+(window.devicePixelRatio||1));}catch(e){}
-    try{parts.push('cores:'+(navigator.hardwareConcurrency||0));}catch(e){}
-    try{parts.push('mem:'+(navigator.deviceMemory||0));}catch(e){}
-    try{parts.push('touch:'+(navigator.maxTouchPoints||0));}catch(e){}
-    // WebGL renderer (GPU fingerprint — very stable)
-    try{
-      var c=document.createElement('canvas');var gl=c.getContext('webgl')||c.getContext('experimental-webgl');
-      if(gl){
-        var dbg=gl.getExtension('WEBGL_debug_renderer_info');
-        if(dbg){parts.push('glv:'+gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL));parts.push('glr:'+gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL));}
-        parts.push('glver:'+gl.getParameter(gl.VERSION));
-        parts.push('glsl:'+gl.getParameter(gl.SHADING_LANGUAGE_VERSION));
-      }
-    }catch(e){}
-    // Canvas fingerprint (rendering differences between GPUs)
-    try{
-      var cv=document.createElement('canvas');cv.width=240;cv.height=60;
-      var cx=cv.getContext('2d');
-      cx.textBaseline='alphabetic';cx.fillStyle='#f60';cx.fillRect(125,1,62,20);
-      cx.fillStyle='#069';cx.font='11pt Arial';cx.fillText('Cwm fjord veg',2,15);
-      cx.fillStyle='rgba(102,204,0,0.7)';cx.font='18pt Arial';cx.fillText('Cwm fjord veg',4,45);
-      parts.push('cvs:'+cv.toDataURL().slice(-50));
-    }catch(e){}
-    // AudioContext fingerprint
-    try{
-      var actx=new(window.OfflineAudioContext||window.webkitOfflineAudioContext)(1,44100,44100);
-      var osc=actx.createOscillator();osc.type='triangle';osc.frequency.setValueAtTime(10000,actx.currentTime);
-      var comp=actx.createDynamicsCompressor();
-      comp.threshold.setValueAtTime(-50,actx.currentTime);comp.knee.setValueAtTime(40,actx.currentTime);
-      comp.ratio.setValueAtTime(12,actx.currentTime);comp.attack.setValueAtTime(0,actx.currentTime);comp.release.setValueAtTime(0.25,actx.currentTime);
-      osc.connect(comp);comp.connect(actx.destination);osc.start(0);
-      actx.startRendering().then(function(buf){
-        var d=buf.getChannelData(0);var sum=0;for(var i=4500;i<5000;i++)sum+=Math.abs(d[i]);
-        parts.push('audio:'+sum.toFixed(6));
-        cb(fnv1a(parts.join('|')));
-      }).catch(function(){cb(fnv1a(parts.join('|')));});
-      setTimeout(function(){cb(fnv1a(parts.join('|')));},1000);
-    }catch(e){
-      cb(fnv1a(parts.join('|')));
-    }
-  }
-
-  // --- Auth flow ---
-  // statusReq queries /tg/auth/status on the server host baked into this
-  // script FIRST — on an external Lampa (lampa.mx with our server plugged
-  // in) the page origin is a foreign host where /tg/auth/status doesn't
-  // exist, and some SPAs answer unknown paths with a 200 that would end the
-  // ladder with a bogus non-authorized result. The page origin stays as a
-  // fallback for the one case where _srvHost is garbage: a reverse proxy
-  // that didn't forward the Host header.
-  function statusReq(qs,done,fail){
-    var hosts=[];
-    if(_srvHost)hosts.push(_srvHost);
-    if(origin&&origin!==_srvHost)hosts.push(origin);
-    var i=0;
-    function next(){i++;if(i<hosts.length)attempt();else fail();}
-    function attempt(){
-      var x=new XMLHttpRequest();
-      x.open('GET',hosts[i]+'/tg/auth/status?'+qs,true);
-      // Cross-origin fallback needs credentials so the server can set our
-      // auth cookies; same-origin ignores the flag.
-      try{x.withCredentials=true;}catch(e){}
-      x.timeout=8000;
-      x.onload=function(){
-        if(x.status===200){
-          var r=null;
-          try{r=JSON.parse(x.responseText);}catch(e){}
-          if(r){done(r);return;}
-        }
-        next();
-      };
-      x.onerror=next;
-      x.ontimeout=next;
-      x.send();
-    }
-    attempt();
-  }
-  // After a silent recovery, complete the CURRENT session: the plugin
-  // bundle was already served in its limited unauthenticated form, so ask
-  // the on.js bootstrap (window.alcopac_upgrade) to pull the tokenized
-  // full bundle now instead of waiting for the next app restart.
-  function upgradeBundle(tok){
-    try{if(tok&&window.alcopac_upgrade)window.alcopac_upgrade(tok);}catch(e){}
-  }
-  function checkToken(tok){
-    var cub=getCub();
-    // uid rides along so the server can bind this device — on external
-    // Lampa hosts cookies never travel and /lite/* resolves the user by
-    // ?uid= alone; an authorized-but-unbound device still sees the
-    // "authorize" banner in the source list.
-    var uid=ensureUID();
-    statusReq('token='+encodeURIComponent(tok)+(uid?'&uid='+encodeURIComponent(uid):'')+(cub?'&cub='+encodeURIComponent(cub):''),function(r){
-      if(r&&r.authorized){saveToken(r.token||tok);upgradeBundle(r.token||tok);return;}
-      clearToken();
-      // After clearing invalid cookie, check if localStorage had a DIFFERENT valid token
-      try{var ls=localStorage.getItem(LS_TOK);if(ls&&ls!==tok){saveToken(ls);checkToken(ls);return;}}catch(e){}
-      tryRecovery();
-    },function(){});
-  }
-  var token=getToken();
-  if(token){
-    checkToken(token);
-  } else {
-    tryRecovery();
-  }
-
-  function tryRecovery(){
-    var uid=getUID();
-    var cub=getCub();
-    // No uid AND no cub token — nothing this rung can do, go straight to
-    // fingerprints. With a cub token we still ask (and mint a uid so a
-    // successful CUB recovery binds this device).
-    if(uid||cub){
-      if(!uid)uid=ensureUID();
-      statusReq('uid='+encodeURIComponent(uid)+(cub?'&cub='+encodeURIComponent(cub):''),function(r){
-        if(r&&r.authorized){saveToken(r.token||'');upgradeBundle(r.token);return;}
-        tryFingerprint();
-      },tryFingerprint);
-    } else {
-      tryFingerprint();
-    }
-  }
-
-  // Coarse, drift-resistant fingerprint (stable hardware subset) — a secondary
-  // anchor for the case where the precise fp shifted after a firmware update.
-  function stableFP(){
-    var p=[];
-    try{p.push((screen.width||0)+'x'+(screen.height||0));}catch(e){}
-    try{p.push(screen.colorDepth||0);}catch(e){}
-    try{p.push(window.devicePixelRatio||1);}catch(e){}
-    try{p.push(navigator.hardwareConcurrency||0);}catch(e){}
-    try{p.push(navigator.deviceMemory||0);}catch(e){}
-    try{p.push(navigator.platform||'');}catch(e){}
-    try{p.push(navigator.maxTouchPoints||0);}catch(e){}
-    try{p.push(Intl.DateTimeFormat().resolvedOptions().timeZone||'');}catch(e){}
-    try{p.push((navigator.userAgent||'').replace(/[\d.]+/g,'').slice(0,120));}catch(e){}
-    return fnv1a(p.join('|'));
-  }
-  function tryFingerprint(){
-    getFingerprint(function(fp){
-      var sfp=stableFP();
-      var cub=getCub();
-      if(!fp&&!sfp&&!cub){showGate();return;}
-      var qs=[];
-      if(fp)qs.push('fp='+encodeURIComponent(fp));
-      if(sfp)qs.push('sfp='+encodeURIComponent(sfp));
-      if(cub)qs.push('cub='+encodeURIComponent(cub));
-      var uid=ensureUID();
-      if(uid)qs.push('uid='+encodeURIComponent(uid));
-      statusReq(qs.join('&'),function(r){
-        if(r&&r.authorized){saveToken(r.token||'');upgradeBundle(r.token);return;}
-        showGate();
-      },showGate);
-    });
-  }
-
-  // showGate: every silent recovery rung failed — this session is genuinely
-  // unauthenticated. Inside an app we deliberately render NOTHING at boot:
-  // the old fullscreen QR overlay trapped all keys but didn't know LG's
-  // Back (keyCode 461), so on webOS Back fell through to the platform
-  // default and closed the whole app. Auth now happens at the point of
-  // use — the gate middleware answers /lite/* with accsdb+code and
-  // online.js shows the QR card as a Lampa modal (Back handled by Lampa).
-  function showGate(){
-    // Detect if running inside Lampa app (not a plain browser).
-    var isApp=!!(window.Lampa||window.appready||window.AndroidJS||typeof webOS!=='undefined'||/Tizen|WebOS|HbbTV|SMART-TV/i.test(navigator.userAgent));
-    if(!isApp){
-      // The auth page lives on OUR server — the page origin may be a
-      // foreign Lampa host (lampa.mx) where /tg/auth is a 404.
-      window.location.href=(_srvHost||origin)+'/tg/auth';
-    }
-  }
-})();
-(function() {
-  'use strict';
-
-  // Batch Transcoding — pre-transcode series episodes for instant switching.
-// Injected into online.js via {batch-transcoding} template variable.
-// Works with ExoPlayer and any player — replaces episode URLs with HLS playlists.
-(function(){
-  if (!true) return;
-
-  var _batchId = null;
-  var _heartbeatTimer = null;
-
-  function startBatch(element, playlist) {
-    if (!element.isonline || !playlist || playlist.length < 2) return Promise.resolve(false);
-
-    var episodes = [];
-    for (var i = 0; i < Math.min(playlist.length, 20); i++) {
-      var ep = playlist[i];
-      var url = typeof ep.url === 'string' ? ep.url : '';
-      if (!url || /\.(m3u8|mpd)(\?|$)/i.test(url)) continue;
-      episodes.push({ url: url, title: ep.title || '', audioIndex: 0 });
-    }
-
-    if (episodes.length < 2) return Promise.resolve(false);
-
-    return fetch('/transcoding/batch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ episodes: episodes, subtitles: true })
-    })
-    .then(function(resp) {
-      if (!resp.ok) return false;
-      return resp.json();
-    })
-    .then(function(data) {
-      if (!data || !data.batchId) return false;
-
-      _batchId = data.batchId;
-
-      // Replace URLs in playlist with transcoded HLS playlists where available
-      if (data.episodes) {
-        data.episodes.forEach(function(ep) {
-          if (ep.playlistUrl && ep.index < playlist.length) {
-            // For ExoPlayer: replace URL with HLS playlist (method:"play")
-            playlist[ep.index].url = ep.playlistUrl;
-            // Remove quality map — transcoded stream is single quality
-            delete playlist[ep.index].quality;
-            delete playlist[ep.index].qualitys;
-          }
-        });
-
-        // Also update main element if it's the first episode
-        var currentIdx = 0;
-        for (var j = 0; j < playlist.length; j++) {
-          if (playlist[j].url === element.url || playlist[j].title === element.title) {
-            currentIdx = j;
-            break;
-          }
-        }
-        if (data.episodes[currentIdx] && data.episodes[currentIdx].playlistUrl) {
-          element.url = data.episodes[currentIdx].playlistUrl;
-          delete element.quality;
-          delete element.qualitys;
-        }
-      }
-
-      // Start heartbeat
-      stopBatch();
-      _heartbeatTimer = setInterval(function() {
-        if (_batchId) {
-          fetch('/transcoding/batch/' + _batchId + '/heartbeat').catch(function(){});
-        }
-      }, 10000);
-
-      // Listen for episode changes to notify server
-      if (typeof Lampa !== 'undefined' && Lampa.Player && Lampa.Player.listener) {
-        Lampa.Player.listener.follow('playlist', function(data) {
-          if (_batchId && data && typeof data.position === 'number') {
-            fetch('/transcoding/batch/' + _batchId + '/episode/' + data.position, {
-              method: 'POST'
-            }).then(function(resp) {
-              if (!resp.ok) return;
-              return resp.json();
-            }).then(function(info) {
-              // If episode has a playlistUrl, the batch has it ready
-              if (info && info.playlistUrl) {
-                console.log('[BatchTC] Episode ' + data.position + ' ready:', info.state);
-              }
-            }).catch(function(){});
-          }
-        });
-
-        Lampa.Player.listener.follow('destroy', function() {
-          stopBatch();
-        });
-      }
-
-      console.log('[BatchTC] Batch started:', _batchId, 'episodes:', episodes.length);
-      return true;
-    })
-    .catch(function(e) {
-      console.warn('[BatchTC] Failed to start batch:', e);
-      return false;
-    });
-  }
-
-  function stopBatch() {
-    if (_heartbeatTimer) {
-      clearInterval(_heartbeatTimer);
-      _heartbeatTimer = null;
-    }
-    if (_batchId) {
-      fetch('/transcoding/batch/' + _batchId + '/stop').catch(function(){});
-      _batchId = null;
-    }
-  }
-
-  // Expose globally for player-inner.js integration
-  window.__batchTranscoding = {
-    start: startBatch,
-    stop: stopBatch,
-    active: function() { return !!_batchId; }
-  };
-})();
-
-
-  var Defined = {
-    api: 'lampac',
-    localhost: 'https://beta.l-vid.online/',
-    apn: ''
-  };
-
-  var balansers_with_search;
-  
-  var unic_id = Lampa.Storage.get('lampac_unic_id', '');
-  if (!unic_id) {
-    unic_id = Lampa.Utils.uid(8).toLowerCase();
-    Lampa.Storage.set('lampac_unic_id', unic_id);
-  }
-  
-    function getAndroidVersion() {
-  if (Lampa.Platform.is('android')) {
-    try {
-      var current = AndroidJS.appVersion().split('-');
-      return parseInt(current.pop());
-    } catch (e) {
-      return 0;
-    }
-  } else {
-    return 0;
-  }
-}
-
-var hostkey = 'https://beta.l-vid.online'.replace('http://', '').replace('https://', '');
-
-if (!window.rch_nws || !window.rch_nws[hostkey]) {
-  if (!window.rch_nws) window.rch_nws = {};
-
-  window.rch_nws[hostkey] = {
-    type: Lampa.Platform.is('android') ? 'apk' : Lampa.Platform.is('tizen') ? 'cors' : undefined,
-    startTypeInvoke: false,
-    rchRegistry: false,
-    apkVersion: getAndroidVersion()
-  };
-}
-
-window.rch_nws[hostkey].typeInvoke = function rchtypeInvoke(host, call) {
-  if (!window.rch_nws[hostkey].startTypeInvoke) {
-    window.rch_nws[hostkey].startTypeInvoke = true;
-
-    var check = function check(good) {
-      window.rch_nws[hostkey].type = Lampa.Platform.is('android') ? 'apk' : good ? 'cors' : 'web';
-      call();
-    };
-
-    if (Lampa.Platform.is('android') || Lampa.Platform.is('tizen')) check(true);
-    else {
-      var net = new Lampa.Reguest();
-      net.silent('https://beta.l-vid.online'.indexOf(location.host) >= 0 ? 'https://github.com/' : host + '/cors/check', function() {
-        check(true);
-      }, function() {
-        check(false);
-      }, false, {
-        dataType: 'text'
-      });
-    }
-  } else call();
-};
-
-window.rch_nws[hostkey].Registry = function RchRegistry(client, startConnection) {
-  window.rch_nws[hostkey].typeInvoke('https://beta.l-vid.online', function() {
-
-    client.invoke("RchRegistry", JSON.stringify({
-      version: 151,
-      host: location.host,
-      rchtype: Lampa.Platform.is('android') ? 'apk' : Lampa.Platform.is('tizen') ? 'cors' : (window.rch_nws[hostkey].type || 'web'),
-      apkVersion: window.rch_nws[hostkey].apkVersion,
-      player: Lampa.Storage.field('player'),
-	  account_email: Lampa.Storage.get('account_email', ''),
-	  unic_id: Lampa.Storage.get('lampac_unic_id', ''),
-	  profile_id: Lampa.Storage.get('lampac_profile_id', ''),
-	  token: ''
-    }));
-
-    if (client._shouldReconnect && window.rch_nws[hostkey].rchRegistry) {
-      if (startConnection) startConnection();
-      return;
-    }
-
-    window.rch_nws[hostkey].rchRegistry = true;
-
-    client.on('RchRegistry', function(clientIp) {
-      if (startConnection) startConnection();
-    });
-
-    client.on("RchClient", function(rchId, url, data, headers, returnHeaders) {
-      var network = new Lampa.Reguest();
-	  
-	  function sendResult(uri, html) {
-	    $.ajax({
-	      url: 'https://beta.l-vid.online/rch/' + uri + '?id=' + rchId,
-	      type: 'POST',
-	      data: html,
-	      async: true,
-	      cache: false,
-	      contentType: false,
-	      processData: false,
-	      success: function(j) {},
-	      error: function() {
-	        client.invoke("RchResult", rchId, '');
-	      }
-	    });
-	  }
-
-      function result(html) {
-        if (Lampa.Arrays.isObject(html) || Lampa.Arrays.isArray(html)) {
-          html = JSON.stringify(html);
-        }
-
-        if (typeof CompressionStream !== 'undefined' && html && html.length > 1000) {
-          var compressionStream = new CompressionStream('gzip');
-          var encoder = new TextEncoder();
-          var readable = new ReadableStream({
-            start: function(controller) {
-              controller.enqueue(encoder.encode(html));
-              controller.close();
-            }
-          });
-          var compressedStream = readable.pipeThrough(compressionStream);
-          new Response(compressedStream).arrayBuffer()
-            .then(function(compressedBuffer) {
-              var compressedArray = new Uint8Array(compressedBuffer);
-              if (compressedArray.length > html.length) {
-                sendResult('result', html);
-              } else {
-                sendResult('gzresult', compressedArray);
-              }
-            })
-            .catch(function() {
-              sendResult('result', html);
-            });
-
-        } else {
-          sendResult('result', html);
-        }
-      }
-
-      if (url == 'eval') {
-        console.log('RCH', url, data);
-        result(eval(data));
-      } else if (url == 'evalrun') {
-        console.log('RCH', url, data);
-        eval(data);
-      } else if (url == 'ping') {
-        result('pong');
-      } else {
-        console.log('RCH', url);
-        network["native"](url, result, function(e) {
-          console.log('RCH', 'result empty, ' + e.status);
-          result('');
-        }, data, {
-          dataType: 'text',
-          timeout: 1000 * 8,
-          headers: headers,
-          returnHeaders: returnHeaders
-        });
-      }
-    });
-
-    client.on('Connected', function(connectionId) {
-      console.log('RCH', 'ConnectionId: ' + connectionId);
-      window.rch_nws[hostkey].connectionId = connectionId;
-    });
-    client.on('Closed', function() {
-      console.log('RCH', 'Connection closed');
-    });
-    client.on('Error', function(err) {
-      console.log('RCH', 'error:', err);
-    });
-  });
-};
-  window.rch_nws[hostkey].typeInvoke('https://beta.l-vid.online', function() {});
-
-  function rchInvoke(json, call) {
-    if (window.nwsClient && window.nwsClient[hostkey] && window.nwsClient[hostkey]._shouldReconnect){
-      call();
-      return;
-    }
-    if (!window.nwsClient) window.nwsClient = {};
-    if (window.nwsClient[hostkey] && window.nwsClient[hostkey].socket)
-      window.nwsClient[hostkey].socket.close();
-    window.nwsClient[hostkey] = new NativeWsClient(json.nws, {
-      autoReconnect: false
-    });
-    window.nwsClient[hostkey].on('Connected', function(connectionId) {
-      window.rch_nws[hostkey].Registry(window.nwsClient[hostkey], function() {
-        call();
-      });
-    });
-    window.nwsClient[hostkey].connect();
-  }
-
-  function rchRun(json, call) {
-    if (typeof NativeWsClient == 'undefined') {
-      Lampa.Utils.putScript(["https://beta.l-vid.online/js/nws-client-es5.js?v18112025"], function() {}, false, function() {
-        rchInvoke(json, call);
-      }, true);
-    } else {
-      rchInvoke(json, call);
-    }
-  }
-
-  // FNV-1a hash for device fingerprint
-  function fnv1a(str) {
-    var h = 0x811c9dc5;
-    for (var i = 0; i < str.length; i++) {
-      h ^= str.charCodeAt(i);
-      h = Math.imul(h, 0x01000193);
-    }
-    return (h >>> 0).toString(16);
-  }
-
-  // ── Comprehensive device fingerprint ──
-  // Survives cache clear / app reinstall (based on hardware, not storage).
-  // ~15 signals: canvas, WebGL, audio, screen, hardware, timezone, math.
-  var device_fp = '';
-  try {
-    var fp = [];
-
-    // 1. Screen (physical properties)
-    fp.push(screen.width + 'x' + screen.height + ':' + screen.availWidth + 'x' + screen.availHeight);
-    fp.push(screen.colorDepth || 0);
-    fp.push(window.devicePixelRatio || 1);
-
-    // 2. Hardware
-    fp.push(navigator.hardwareConcurrency || 0);
-    fp.push(navigator.deviceMemory || 0);
-    fp.push(navigator.maxTouchPoints || 0);
-
-    // 3. Platform / locale
-    fp.push(navigator.platform || '');
-    fp.push(navigator.language || '');
-    fp.push((navigator.languages || []).join(','));
-
-    // 4. Timezone
-    try { fp.push(Intl.DateTimeFormat().resolvedOptions().timeZone); } catch(e) { fp.push(''); }
-    fp.push(new Date().getTimezoneOffset());
-
-    // 5. Math engine quirks (differ between JS engines)
-    fp.push(Math.tan(-1e300));
-
-    // 6. Canvas fingerprint (GPU + font rendering)
-    try {
-      var c = document.createElement('canvas');
-      c.width = 280; c.height = 60;
-      var x = c.getContext('2d');
-      if (x) {
-        x.textBaseline = 'alphabetic';
-        x.fillStyle = '#f60';
-        x.fillRect(125, 1, 62, 20);
-        x.fillStyle = '#069';
-        x.font = '14px Arial';
-        x.fillText('Cwm fjordbank glyphs vext quiz', 2, 15);
-        x.fillStyle = 'rgba(102,204,0,0.7)';
-        x.font = '18px Times New Roman';
-        x.fillText('Cwm fjordbank glyphs vext quiz', 4, 45);
-        x.globalCompositeOperation = 'multiply';
-        x.fillStyle = 'rgb(255,0,255)';
-        x.beginPath(); x.arc(50, 50, 50, 0, Math.PI * 2, true); x.closePath(); x.fill();
-        x.fillStyle = 'rgb(0,255,255)';
-        x.beginPath(); x.arc(100, 50, 50, 0, Math.PI * 2, true); x.closePath(); x.fill();
-        fp.push(fnv1a(c.toDataURL()));
-      } else fp.push('nc');
-    } catch(e) { fp.push('nc'); }
-
-    // 7. WebGL fingerprint (GPU model + capabilities)
-    try {
-      var gc = document.createElement('canvas');
-      var gl = gc.getContext('webgl') || gc.getContext('experimental-webgl');
-      if (gl) {
-        var di = gl.getExtension('WEBGL_debug_renderer_info');
-        fp.push(di ? gl.getParameter(di.UNMASKED_VENDOR_WEBGL) : '');
-        fp.push(di ? gl.getParameter(di.UNMASKED_RENDERER_WEBGL) : '');
-        fp.push(gl.getParameter(gl.MAX_TEXTURE_SIZE));
-        fp.push(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE));
-        fp.push(gl.getParameter(gl.MAX_VERTEX_ATTRIBS));
-        fp.push(gl.getParameter(gl.MAX_VARYING_VECTORS));
-        var lw = gl.getParameter(gl.ALIASED_LINE_WIDTH_RANGE);
-        fp.push(lw ? lw[0]+','+lw[1] : '');
-        var ps = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE);
-        fp.push(ps ? ps[0]+','+ps[1] : '');
-        fp.push(fnv1a((gl.getSupportedExtensions() || []).join(',')));
-      } else fp.push('ng');
-    } catch(e) { fp.push('ng'); }
-
-    // 8. Audio (hardware sample rate + channels)
-    try {
-      var ac = new (window.AudioContext || window.webkitAudioContext)();
-      fp.push(ac.sampleRate);
-      fp.push(ac.destination.maxChannelCount);
-      ac.close();
-    } catch(e) { fp.push('na'); }
-
-    device_fp = fnv1a(fp.join('|||'));
-  } catch(e) {}
-
-  function account(url) {
-    url = url + '';
-    if (url.indexOf('account_email=') == -1) {
-      var email = Lampa.Storage.get('account_email');
-      if (email) url = Lampa.Utils.addUrlComponent(url, 'account_email=' + encodeURIComponent(email));
-    }
-    if (url.indexOf('uid=') == -1) {
-      var uid = Lampa.Storage.get('lampac_unic_id', '');
-      if (uid) url = Lampa.Utils.addUrlComponent(url, 'uid=' + encodeURIComponent(uid));
-    }
-    if (url.indexOf('token=') == -1) {
-      var token = '';
-      if (!token) {
-        try { var m = document.cookie.match(/(?:^|;\s*)lampac_token=([^;]+)/); if (m) token = decodeURIComponent(m[1]); } catch(e) {}
-      }
-      if (!token) {
-        try { token = localStorage.getItem('lampac_auth_token') || ''; } catch(e) {}
-      }
-      if (token) url = Lampa.Utils.addUrlComponent(url, 'token=' + encodeURIComponent(token));
-    }
-    if (url.indexOf('fp=') == -1 && device_fp) {
-      url = Lampa.Utils.addUrlComponent(url, 'fp=' + encodeURIComponent(device_fp));
-    }
-    if (url.indexOf('nws_id=') == -1 && window.rch_nws && window.rch_nws[hostkey]) {
-      var nws_id = window.rch_nws[hostkey].connectionId || Lampa.Storage.get('lampac_nws_id', '');
-      if (nws_id) url = Lampa.Utils.addUrlComponent(url, 'nws_id=' + encodeURIComponent(nws_id));
-    }
-    return url;
-  }
-  
-  // lampacAuthHeaders — returns {X-Lampac-Token, X-Alpac-Token} when a
-  // token is reachable from Lampa.Storage / localStorage / document.cookie.
-  // Cross-origin Lampa (host on lampa.mx, our backend on alpac.cc) loses
-  // the Set-Cookie in XHR responses; the same token is mirrored into
-  // localStorage by the auth-gate JS in /on.js and into Lampa.Storage by
-  // syncpro/account plugins. Forwarding it as an explicit header lets
-  // the server's auth middleware accept the request even when the
-  // cookie was stripped. Mirrors account.js bestKnownToken() so /lite/*
-  // requests stop returning the "accsdb" auth-required banner for users
-  // who are signed in but whose browser eats our cookie. Returns {} when
-  // no token is reachable — callers Object.assign it onto their static
-  // headers without conditional logic.
-  function lampacAuthHeaders() {
-    var names = ['alpac_token', 'lampac_token'];
-    var tok = '';
-    try {
-      if (Lampa && Lampa.Storage) {
-        for (var i = 0; i < names.length && !tok; i++) tok = Lampa.Storage.get(names[i], '') || '';
-        if (!tok) tok = Lampa.Storage.get('lampac_auth_token', '') || '';
-      }
-    } catch (e) {}
-    if (!tok) {
-      try { tok = localStorage.getItem('lampac_auth_token') || ''; } catch (e) {}
-    }
-    if (!tok) {
-      try {
-        for (var j = 0; j < names.length && !tok; j++) {
-          var re = new RegExp('(?:^|;\\s*)' + names[j] + '=([^;]*)');
-          var m = document.cookie.match(re);
-          if (m && m[1]) tok = decodeURIComponent(m[1]);
-        }
-      } catch (e) {}
-    }
-    if (!tok) return {};
-    return {'X-Lampac-Token': tok, 'X-Alpac-Token': tok};
-  }
-
-  var Network = Lampa.Reguest;
-
-  function component(object) {
-    var network = new Network();
-    var scroll = new Lampa.Scroll({
-      mask: true,
-      over: true
-    });
-    var files = new Lampa.Explorer(object);
-    var filter = new Lampa.Filter(object);
-    var sources = {};
-    var last;
-    var source;
-    var balanser;
-    var initialized;
-    var balanser_timer;
-    var images = [];
-    var number_of_requests = 0;
-    var number_of_requests_timer;
-    var life_wait_times = 0;
-    var life_wait_timer;
-    var filter_sources = {};
-    var filter_translate = {
-      season: Lampa.Lang.translate('torrent_serial_season'),
-      voice: Lampa.Lang.translate('torrent_parser_voice'),
-      source: Lampa.Lang.translate('settings_rest_source')
-    };
-    var filter_find = {
-      season: [],
-      voice: []
-    };
-	
-    if (balansers_with_search == undefined) {
-      network.timeout(10000);
-      network.silent(account('https://beta.l-vid.online/lite/withsearch'), function(json) {
-        balansers_with_search = json;
-      }, function() {
-		  balansers_with_search = [];
-	  });
-    }
-	
-    function balanserName(j) {
-      var bals = j.balanser;
-      var name = j.name.split(' ')[0];
-      return (bals || name).toLowerCase();
-    }
-
-    // lampacBalanserRename — per-profile custom display name for a balancer.
-    // The rename map is edited from the syncpro profile UI and stored as
-    // { '<profile_id>': { '<balanserKey>': 'Custom name' } }. We also record
-    // every balancer we display into 'lampac_balansers_seen' so that UI can
-    // list them. Returns the custom name when set, else the server default.
-    function lampacBalanserRename(key, def) {
-      try {
-        var seen = Lampa.Storage.get('lampac_balansers_seen', {});
-        if (seen[key] !== def) { seen[key] = def; Lampa.Storage.set('lampac_balansers_seen', seen); }
-        var pid = String(Lampa.Storage.get('lampac_profile_id', '') || '');
-        var all = Lampa.Storage.get('lampac_balanser_names', {});
-        var map = all[pid] || {};
-        var custom = map[key];
-        return (custom && String(custom).trim()) ? custom : def;
-      } catch (e) { return def; }
-    }
-	
-	function clarificationSearchAdd(value){
-		var id = Lampa.Utils.hash(object.movie.number_of_seasons ? object.movie.original_name : object.movie.original_title);
-		var all = Lampa.Storage.get('clarification_search','{}');
-		
-		all[id] = value;
-		
-		Lampa.Storage.set('clarification_search',all);
-	}
-	
-	function clarificationSearchDelete(){
-		var id = Lampa.Utils.hash(object.movie.number_of_seasons ? object.movie.original_name : object.movie.original_title);
-		var all = Lampa.Storage.get('clarification_search','{}');
-		
-		delete all[id];
-		
-		Lampa.Storage.set('clarification_search',all);
-	}
-	
-	function clarificationSearchGet(){
-		var id = Lampa.Utils.hash(object.movie.number_of_seasons ? object.movie.original_name : object.movie.original_title);
-		var all = Lampa.Storage.get('clarification_search','{}');
-		
-		return all[id];
-	}
-	
-    this.initialize = function() {
-      var _this = this;
-      this.loading(true);
-      filter.onSearch = function(value) {
-		  
-		clarificationSearchAdd(value);
-		
-        Lampa.Activity.replace({
-          search: value,
-          clarification: true,
-          similar: true
-        });
-      };
-      filter.onBack = function() {
-        _this.start();
-      };
-      filter.render().find('.selector').on('hover:enter', function() {
-        clearInterval(balanser_timer);
-      });
-      filter.render().find('.filter--search').appendTo(filter.render().find('.torrent-filter'));
-      filter.onSelect = function(type, a, b) {
-        if (type == 'filter') {
-          if (a.reset) {
-			  clarificationSearchDelete();
-			  
-            _this.replaceChoice({
-              season: 0,
-              voice: 0,
-              voice_url: '',
-              voice_name: ''
-            });
-            setTimeout(function() {
-              Lampa.Select.close();
-              Lampa.Activity.replace({
-				  clarification: 0,
-				  similar: 0
-			  });
-            }, 10);
-          } else {
-            var url = filter_find[a.stype][b.index].url;
-            var choice = _this.getChoice();
-            if (a.stype == 'voice') {
-              choice.voice_name = filter_find.voice[b.index].title;
-              choice.voice_url = url;
-            }
-            choice[a.stype] = b.index;
-            _this.saveChoice(choice);
-            _this.reset();
-            _this.request(url);
-            setTimeout(Lampa.Select.close, 10);
-          }
-        } else if (type == 'sort') {
-          Lampa.Select.close();
-          object.lampac_custom_select = a.source;
-          _this.changeBalanser(a.source);
-        }
-      };
-      if (filter.addButtonBack) filter.addButtonBack();
-      filter.render().find('.filter--sort span').text(Lampa.Lang.translate('lampac_balanser'));
-      scroll.body().addClass('torrent-list');
-      files.appendFiles(scroll.render());
-      files.appendHead(filter.render());
-      scroll.minus(files.render().find('.explorer__files-head'));
-      scroll.body().append(Lampa.Template.get('lampac_content_loading'));
-      Lampa.Controller.enable('content');
-      this.loading(false);
-	  if(object.balanser){
-		  files.render().find('.filter--search').remove();
-		  sources = {};
-		  sources[object.balanser] = {name: object.balanser};
-		  balanser = object.balanser;
-		  filter_sources = [];
-		  
-		  return network["native"](account(object.url.replace('rjson=','nojson=')), this.parse.bind(this), function(){
-			  files.render().find('.torrent-filter').remove();
-			  _this.empty();
-		  }, false, {
-            dataType: 'text',
-			headers: Object.assign({'X-Kit-AesGcm': Lampa.Storage.get('aesgcmkey', '')}, lampacAuthHeaders())
-		  });
-	  } 
-      this.externalids().then(function() {
-        return _this.createSource();
-      }).then(function(json) {
-        if (!balansers_with_search.find(function(b) {
-            return balanser.slice(0, b.length) == b;
-          })) {
-          filter.render().find('.filter--search').addClass('hide');
-        }
-        _this.search();
-      })["catch"](function(e) {
-        _this.noConnectToServer(e);
-      });
-    };
-    this.rch = function(json, noreset) {
-      var _this2 = this;
-	  rchRun(json, function() {
-        if (!noreset) _this2.find();
-        else noreset();
-	  });
-    };
-    this.externalids = function() {
-      return new Promise(function(resolve, reject) {
-        if (!object.movie.imdb_id || !object.movie.kinopoisk_id) {
-          var query = [];
-          query.push('id=' + encodeURIComponent(object.movie.id));
-          query.push('serial=' + (object.movie.name ? 1 : 0));
-          if (object.movie.imdb_id) query.push('imdb_id=' + (object.movie.imdb_id || ''));
-          if (object.movie.kinopoisk_id) query.push('kinopoisk_id=' + (object.movie.kinopoisk_id || ''));
-          var url = Defined.localhost + 'externalids?' + query.join('&');
-          network.timeout(10000);
-          network.silent(account(url), function(json) {
-            for (var name in json) {
-              object.movie[name] = json[name];
-            }
-            resolve();
-          }, function() {
-            resolve();
-          }, false, {
-			headers: Object.assign({'X-Kit-AesGcm': Lampa.Storage.get('aesgcmkey', '')}, lampacAuthHeaders())
-		  });
-        } else resolve();
-      });
-    };
-    this.updateBalanser = function(balanser_name) {
-      var last_select_balanser = Lampa.Storage.cache('online_last_balanser', 3000, {});
-      // A corrupt storage value (e.g. literal "[object Object]" left by an old
-      // build or a cub backup/restore round-trip) makes Storage.cache hand back
-      // a string. Assigning a property to it throws "Cannot create property on
-      // string" on old WebKit (LG webOS). Reset to a clean dict, which also
-      // heals storage on the Storage.set below.
-      if (!last_select_balanser || typeof last_select_balanser !== 'object') last_select_balanser = {};
-      last_select_balanser[object.movie.id] = balanser_name;
-      Lampa.Storage.set('online_last_balanser', last_select_balanser);
-    };
-    this.changeBalanser = function(balanser_name) {
-      this.updateBalanser(balanser_name);
-      Lampa.Storage.set('online_balanser', balanser_name);
-      Lampa.Storage.set('active_balanser', balanser_name);
-      var to = this.getChoice(balanser_name);
-      var from = this.getChoice();
-      if (from.voice_name) to.voice_name = from.voice_name;
-      this.saveChoice(to, balanser_name);
-      // Fast path: when the user picks a balancer that's already in our
-      // sources map (i.e. we already fetched /lite/events for this card),
-      // switch directly to its result URL instead of running Activity.replace()
-      // which fully reloads the activity and re-probes every balancer.
-      // The events list stays valid until the activity is exited.
-      if (sources[balanser_name] && sources[balanser_name].url) {
-        balanser = balanser_name;
-        source = sources[balanser_name].url;
-        this.reset();
-        this.find();
-        return;
-      }
-      Lampa.Activity.replace();
-    };
-    this.requestParams = function(url) {
-      var query = [];
-      var card_source = object.movie.source || 'tmdb'; //Lampa.Storage.field('source')
-      query.push('id=' + encodeURIComponent(object.movie.id));
-      if (object.movie.imdb_id) query.push('imdb_id=' + (object.movie.imdb_id || ''));
-      if (object.movie.kinopoisk_id) query.push('kinopoisk_id=' + (object.movie.kinopoisk_id || ''));
-	  if (object.movie.tmdb_id) query.push('tmdb_id=' + (object.movie.tmdb_id || ''));
-      query.push('title=' + encodeURIComponent(object.clarification ? object.search : object.movie.title || object.movie.name));
-      query.push('original_title=' + encodeURIComponent(object.movie.original_title || object.movie.original_name));
-      query.push('serial=' + (object.movie.name ? 1 : 0));
-      query.push('original_language=' + (object.movie.original_language || ''));
-      query.push('year=' + ((object.movie.release_date || object.movie.first_air_date || '0000') + '').slice(0, 4));
-      query.push('source=' + card_source);
-      query.push('clarification=' + (object.clarification ? 1 : 0));
-      query.push('similar=' + (object.similar ? true : false));
-      query.push('rchtype=' + (((window.rch_nws && window.rch_nws[hostkey]) ? window.rch_nws[hostkey].type : (window.rch && window.rch[hostkey]) ? window.rch[hostkey].type : '') || ''));
-      if (Lampa.Storage.get('account_email', '')) query.push('cub_id=' + Lampa.Utils.hash(Lampa.Storage.get('account_email', '')));
-      return url + (url.indexOf('?') >= 0 ? '&' : '?') + query.join('&');
-    };
-    this.getLastChoiceBalanser = function() {
-      var last_select_balanser = Lampa.Storage.cache('online_last_balanser', 3000, {});
-      if (last_select_balanser[object.movie.id]) {
-        return last_select_balanser[object.movie.id];
-      } else {
-        return Lampa.Storage.get('online_balanser', filter_sources.length ? filter_sources[0] : '');
-      }
-    };
-    this.startSource = function(json) {
-      return new Promise(function(resolve, reject) {
-        json.forEach(function(j) {
-          var name = balanserName(j);
-          sources[name] = {
-            url: j.url,
-            name: lampacBalanserRename(name, j.name),
-            show: typeof j.show == 'undefined' ? true : j.show
-          };
-        });
-        filter_sources = Lampa.Arrays.getKeys(sources);
-        if (filter_sources.length) {
-          var last_select_balanser = Lampa.Storage.cache('online_last_balanser', 3000, {});
-          if (last_select_balanser[object.movie.id]) {
-            balanser = last_select_balanser[object.movie.id];
-          } else {
-            balanser = Lampa.Storage.get('online_balanser', filter_sources[0]);
-          }
-          if (!sources[balanser]) balanser = filter_sources[0];
-          if (!sources[balanser].show && !object.lampac_custom_select) balanser = filter_sources[0];
-          source = sources[balanser].url;
-          Lampa.Storage.set('active_balanser', balanser);
-          resolve(json);
-        } else {
-          reject();
-        }
-      });
-    };
-    this.lifeSource = function() {
-      var _this3 = this;
-      return new Promise(function(resolve, reject) {
-        var url = _this3.requestParams(Defined.localhost + 'lifeevents?memkey=' + (_this3.memkey || ''));
-        var red = false;
-        var gou = function gou(json, any) {
-          if (json.accsdb) return reject(json);
-          var last_balanser = _this3.getLastChoiceBalanser();
-          if (!red) {
-            var _filter = json.online.filter(function(c) {
-              return any ? c.show : c.show && c.name.toLowerCase() == last_balanser;
-            });
-            if (_filter.length) {
-              red = true;
-              resolve(json.online.filter(function(c) {
-                return c.show;
-              }));
-            } else if (any) {
-              reject();
-            }
-          }
-        };
-        var fin = function fin(call) {
-          network.timeout(3000);
-          network.silent(account(url), function(json) {
-            life_wait_times++;
-            if (!json || !Array.isArray(json.online)) {
-              if (life_wait_times > 15) { reject(); return; }
-              life_wait_timer = setTimeout(fin, 1000);
-              return;
-            }
-            filter_sources = [];
-            sources = {};
-            json.online.forEach(function(j) {
-              var name = balanserName(j);
-              sources[name] = {
-                url: j.url,
-                name: lampacBalanserRename(name, j.name),
-                show: typeof j.show == 'undefined' ? true : j.show
-              };
-            });
-            filter_sources = Lampa.Arrays.getKeys(sources);
-            filter.set('sort', filter_sources.map(function(e) {
-              return {
-                title: sources[e].name,
-                source: e,
-                selected: e == balanser,
-                ghost: !sources[e].show
-              };
-            }));
-            filter.chosen('sort', [sources[balanser] ? sources[balanser].name : balanser]);
-            gou(json);
-            var lastb = _this3.getLastChoiceBalanser();
-            if (life_wait_times > 15 || json.ready) {
-              filter.render().find('.lampac-balanser-loader').remove();
-              gou(json, true);
-            } else if (!red && sources[lastb] && sources[lastb].show) {
-              gou(json, true);
-              life_wait_timer = setTimeout(fin, 1000);
-            } else {
-              life_wait_timer = setTimeout(fin, 1000);
-            }
-          }, function() {
-            life_wait_times++;
-            if (life_wait_times > 15) {
-              reject();
-            } else {
-              life_wait_timer = setTimeout(fin, 1000);
-            }
-          }, false, {
-			headers: Object.assign({'X-Kit-AesGcm': Lampa.Storage.get('aesgcmkey', '')}, lampacAuthHeaders())
-		  });
-        };
-        fin();
-      });
-    };
-    this.createSource = function() {
-      var _this4 = this;
-      return new Promise(function(resolve, reject) {
-        var url = _this4.requestParams(Defined.localhost + 'lite/events?life=true');
-        network.timeout(15000);
-        network.silent(account(url), function(json) {
-          if (json.accsdb) return reject(json);
-          if (json.life) {
-			_this4.memkey = json.memkey;
-			if (json.title) {
-              if (object.movie.name) object.movie.name = json.title;
-              if (object.movie.title) object.movie.title = json.title;
-			}
-            filter.render().find('.filter--sort').append('<span class="lampac-balanser-loader" style="width: 1.2em; height: 1.2em; margin-top: 0; background: url(./img/loader.svg) no-repeat 50% 50%; background-size: contain; margin-left: 0.5em"></span>');
-            _this4.lifeSource().then(_this4.startSource).then(resolve)["catch"](reject);
-          } else {
-            _this4.startSource(json).then(resolve)["catch"](reject);
-          }
-        }, reject, false, {
-			headers: Object.assign({'X-Kit-AesGcm': Lampa.Storage.get('aesgcmkey', '')}, lampacAuthHeaders())
-		  });
-      });
-    };
+    /* ---------- src/config.js ---------- */
     /**
-     * Подготовка
+     * Конфигурация плагина.
+     * PLACEHOLDER'ы вида {localhost} / {token} подставляет lampac,
+     * если файл раздаётся сервером как /netflix_ui.js. При ручной
+     * установке они остаются нетронутыми и игнорируются (см. utils.host).
      */
-    this.create = function() {
-      return this.render();
-    };
-    /**
-     * Начать поиск
-     */
-    this.search = function() { //this.loading(true)
-      this.filter({
-        source: filter_sources
-      }, this.getChoice());
-      this.find();
-    };
-    this.find = function() {
-      this.request(this.requestParams(source));
-    };
-    this.request = function(url) {
-      number_of_requests++;
-      if (number_of_requests < 10) {
-        network["native"](account(url), this.parse.bind(this), this.doesNotAnswer.bind(this), false, {
-          dataType: 'text',
-		  headers: Object.assign({'X-Kit-AesGcm': Lampa.Storage.get('aesgcmkey', '')}, lampacAuthHeaders())
-        });
-        clearTimeout(number_of_requests_timer);
-        number_of_requests_timer = setTimeout(function() {
-          number_of_requests = 0;
-        }, 4000);
-      } else this.empty();
-    };
-    this.parseJsonDate = function(str, name) {
-      try {
-        var html = $('<div>' + str + '</div>');
-        var elems = [];
-        html.find(name).each(function() {
-          var item = $(this);
-          var data = JSON.parse(item.attr('data-json'));
-          var season = item.attr('s');
-          var episode = item.attr('e');
-          var text = item.text();
-          if (!object.movie.name) {
-            if (text.match(/\d+p/i)) {
-              if (!data.quality) {
-                data.quality = {};
-                data.quality[text] = data.url;
-              }
-              text = object.movie.title;
-            }
-            if (text == 'По умолчанию') {
-              text = object.movie.title;
-            }
-          }
-          if (episode) data.episode = parseInt(episode);
-          if (season) data.season = parseInt(season);
-          if (text) data.text = text;
-          data.active = item.hasClass('active');
-          elems.push(data);
-        });
-        return elems;
-      } catch (e) {
-        return [];
-      }
-    };
-    this.getFileUrl = function(file, call, waiting_rch) {
-	  var _this = this;
-	  
-      if(Lampa.Storage.field('player') !== 'inner' && file.stream && Lampa.Platform.is('apple')){
-		  var newfile = Lampa.Arrays.clone(file);
-		  newfile.method = 'play';
-		  newfile.url = file.stream;
-		  call(newfile, {});
-	  }
-      else if (file.method == 'play') call(file, {});
-      else if (file.method == 'iframe' && file.url) _this.playIframe(file.url);
-      else {
-        Lampa.Loading.start(function() {
-          Lampa.Loading.stop();
-          Lampa.Controller.toggle('content');
-          network.clear();
-        });
-        network["native"](account(file.url), function(json) {
-			if(json.rch){
-				if(waiting_rch) {
-					waiting_rch = false;
-					Lampa.Loading.stop();
-					call(false, {});
-				}
-				else {
-					_this.rch(json,function(){
-						Lampa.Loading.stop();
-						
-						_this.getFileUrl(file, call, true);
-					});
-				}
-			}
-			else if (json && json.method == 'iframe' && json.url) {
-				// Direct-iframe playback (e.g. alloha in iframe_mode): the source's own
-				// web player runs inside an <iframe> and resolves the CDN itself — never
-				// hand it to Lampa.Player (it's an HTML page, not an m3u8).
-				Lampa.Loading.stop();
-				_this.playIframe(json.url);
-			}
-			else{
-				Lampa.Loading.stop();
-				call(json, json);
-			}
-        }, function() {
-          Lampa.Loading.stop();
-          call(false, {});
-        }, false, {
-			headers: Object.assign({'X-Kit-AesGcm': Lampa.Storage.get('aesgcmkey', '')}, lampacAuthHeaders())
-		  });
-      }
-    };
-    this.playIframe = function(url) {
-      // Fullscreen overlay hosting the source's own web player. Lampa runs inside a
-      // WebView/browser shell, so a cross-origin iframe embeds fine (its referer =
-      // this page's origin, which the player accepts). We focus the iframe so the
-      // remote's OK/arrows drive the embedded player, and trap Back to close it.
-      // NB: once a cross-origin iframe holds focus the parent can't see its key
-      // events, so Back is caught two ways (Lampa.Controller + a capture-phase
-      // keydown listener) — whichever the shell delivers wins. Needs on-device
-      // checking per platform (webOS RETURN=461, Tizen=10009, Android KEYCODE_BACK).
-      var prev = (Lampa.Controller.enabled() && Lampa.Controller.enabled().name) || 'content';
-      var overlay = $('<div class="alloha-iframe-overlay" style="position:fixed;top:0;left:0;right:0;bottom:0;z-index:1200;background:#000"></div>');
-      var frame = $('<iframe allow="autoplay; fullscreen; encrypted-media" allowfullscreen style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;background:#000"></iframe>');
-      frame.attr('src', url);
-      overlay.append(frame);
-      var closed = false;
+    var NFX = {
+        version: '1.0.0',
+        id: 'netflix_ui',
+        title: 'Netflix UI',
 
-      function onKey(e) {
-        var k = e.keyCode || e.which;
-        if (k == 8 || k == 27 || k == 461 || k == 10009) { // Back / Esc / webOS / Tizen
-          e.preventDefault();
-          e.stopPropagation();
-          close();
-        }
-      }
-      function close() {
-        if (closed) return;
-        closed = true;
-        document.removeEventListener('keydown', onKey, true);
-        try { frame.attr('src', 'about:blank'); } catch (e) {}
-        overlay.remove();
-        try { Lampa.Controller.remove('alloha_iframe'); } catch (e) {}
-        Lampa.Controller.toggle(prev);
-      }
+        // Подставляется lampac'ом
+        tpl_host: '{localhost}',
+        tpl_token: '{token}',
 
-      $('body').append(overlay);
-      document.addEventListener('keydown', onKey, true);
-      Lampa.Controller.add('alloha_iframe', {
-        toggle: function() {},
-        back: close
-      });
-      Lampa.Controller.toggle('alloha_iframe');
-      try { frame[0].focus(); } catch (e) {}
-    };
-    this.toPlayElement = function(file) {
-      var play = {
-        title: file.title,
-        url: file.url,
-        quality: file.qualitys,
-        timeline: file.timeline,
-        subtitles: file.subtitles,
-		segments: file.segments,
-        callback: file.mark,
-		season: file.season,
-		episode: file.episode,
-		voice_name: file.voice_name,
-		thumbnail: file.thumbnail,
-		fxdirect: file.fxdirect
-      };
-      return play;
-    };
-    this.orUrlReserve = function(data) {
-      if (data.url && typeof data.url == 'string' && data.url.indexOf(" or ") !== -1) {
-        var urls = data.url.split(" or ");
-        data.url = urls[0];
-        data.url_reserve = urls[1];
-      }
-    };
-    this.setDefaultQuality = function(data) {
-      if (Lampa.Arrays.getKeys(data.quality).length) {
-        for (var q in data.quality) {
-          if (parseInt(q) == Lampa.Storage.field('video_quality_default')) {
-            data.url = data.quality[q];
-            this.orUrlReserve(data);
-          }
-          if (data.quality[q].indexOf(" or ") !== -1)
-            data.quality[q] = data.quality[q].split(" or ")[0];
-        }
-      }
-    };
-    this.display = function(videos) {
-      var _this5 = this;
-      this.draw(videos, {
-        onEnter: function onEnter(item, html) {
-          _this5.getFileUrl(item, function(json, json_call) {
-            if (json && json.url) {
-              var playlist = [];
-              var first = _this5.toPlayElement(item);
-              first.url = json.url;
-              first.headers = json_call.headers || json.headers;
-              first.quality = json_call.quality || item.qualitys;
-			  first.segments = json_call.segments || item.segments;
-              first.hls_manifest_timeout = json_call.hls_manifest_timeout || json.hls_manifest_timeout;
-              first.subtitles = json.subtitles;
-			  first.subtitles_call = json_call.subtitles_call || json.subtitles_call;
-			  if (json.vast && json.vast.url) {
-                first.vast_url = json.vast.url;
-                first.vast_msg = json.vast.msg;
-                first.vast_region = json.vast.region;
-                first.vast_platform = json.vast.platform;
-                first.vast_screen = json.vast.screen;
-			  }
-              _this5.orUrlReserve(first);
-              _this5.setDefaultQuality(first);
-              if (item.season) {
-                videos.forEach(function(elem) {
-                  var cell = _this5.toPlayElement(elem);
-                  if (elem == item) cell.url = json.url;
-                  else {
-                    if (elem.method == 'call') {
-                      if (Lampa.Storage.field('player') !== 'inner') {
-                        cell.url = elem.stream;
-						delete cell.quality;
-                      } else {
-                        cell.url = function(call) {
-                          _this5.getFileUrl(elem, function(stream, stream_json) {
-                            if (stream.url) {
-                              cell.url = stream.url;
-                              cell.quality = stream_json.quality || elem.qualitys;
-							  cell.segments = stream_json.segments || elem.segments;
-                              cell.subtitles = stream.subtitles;
-                              _this5.orUrlReserve(cell);
-                              _this5.setDefaultQuality(cell);
-                              elem.mark();
-                            } else {
-                              cell.url = '';
-                              Lampa.Noty.show(Lampa.Lang.translate('lampac_nolink'));
-                            }
-                            call();
-                          }, function() {
-                            cell.url = '';
-                            call();
-                          });
-                        };
-                      }
-                    } else {
-                      cell.url = elem.url;
-                    }
-                  }
-                  _this5.orUrlReserve(cell);
-                  _this5.setDefaultQuality(cell);
-                  playlist.push(cell);
-                }); //Lampa.Player.playlist(playlist) 
-              } else {
-                playlist.push(first);
-              }
-              if (playlist.length > 1) first.playlist = playlist;
-              if (first.url) {
-                var element = first;
-				element.isonline = true;
-                if (filter_find.voice && filter_find.voice.length > 1) {
-                  element.voices = filter_find.voice;
-                  element.voice_index = _this5.getChoice(balanser).voice || 0;
-                }
-                if (element.url && element.isonline) {
-  // online.js
-}
-else if (element.url) {
-  if (false) {
-    if (Platform.is('browser') && location.host.indexOf("127.0.0.1") !== -1) {
-      Noty.show('Видео открыто в playerInner', {time: 3000});
-      $.get('https://beta.l-vid.online/player-inner/' + element.url);
-      return;
-    }
+        // Заполняется в utils.detect()
+        host: '',
+        token: '',
 
-    Player.play(element);
-  } 
-  else {
-    if (true && Platform.is('browser') && location.host.indexOf("127.0.0.1") !== -1)
-      Noty.show('Внешний плеер можно указать в init.conf (playerInner)', {time: 3000});
-    Player.play(element);
-  }
-}
-                if (window.__batchTranscoding && playlist.length > 1) {
-                  window.__batchTranscoding.start(element, playlist).then(function(){
-                    Lampa.Player.play(element);
-                    Lampa.Player.playlist(playlist);
-                  });
-                } else {
-                  Lampa.Player.play(element);
-                  Lampa.Player.playlist(playlist);
-                }
-				if(element.subtitles_call) _this5.loadSubtitles(element.subtitles_call)
-                item.mark();
-                _this5.updateBalanser(balanser);
-              } else {
-                Lampa.Noty.show(Lampa.Lang.translate('lampac_nolink'));
-              }
-            } else Lampa.Noty.show(Lampa.Lang.translate('lampac_nolink'));
-          }, true);
+        // Палитра Netflix
+        color: {
+            red: '#e50914',
+            red_dark: '#b20710',
+            bg: '#141414',
+            bg_soft: '#1b1b1b',
+            text: '#ffffff',
+            muted: '#b3b3b3',
+            grey: 'rgba(109,109,110,0.7)'
         },
-        onContextMenu: function onContextMenu(item, html, data, call) {
-          _this5.getFileUrl(item, function(stream) {
-            call({
-              file: stream.url,
-              quality: item.qualitys
-            });
-          }, true);
-        }
-      });
-      this.filter({
-        season: filter_find.season.map(function(s) {
-          return s.title;
-        }),
-        voice: filter_find.voice.map(function(b) {
-          return b.title;
-        })
-      }, this.getChoice());
-    };
-	this.loadSubtitles = function(link){
-		network.silent(account(link), function(subs){
-			Lampa.Player.subtitles(subs)
-		}, function() {},false, {
-			headers: Object.assign({'X-Kit-AesGcm': Lampa.Storage.get('aesgcmkey', '')}, lampacAuthHeaders())
-		  })
-	}
-    this.parse = function(str) {
-      var json = Lampa.Arrays.decodeJson(str, {});
-      if (Lampa.Arrays.isObject(str) && str.rch) json = str;
-      if (json.rch) return this.rch(json);
-      try {
-        var items = this.parseJsonDate(str, '.videos__item');
-        var buttons = this.parseJsonDate(str, '.videos__button');
-        if (items.length == 1 && items[0].method == 'link' && !items[0].similar) {
-          filter_find.season = items.map(function(s) {
-            return {
-              title: s.text,
-              url: s.url
-            };
-          });
-          this.replaceChoice({
-            season: 0
-          });
-          this.request(items[0].url);
-        } else {
-          this.activity.loader(false);
-          var videos = items.filter(function(v) {
-            return v.method == 'play' || v.method == 'call' || v.method == 'iframe';
-          });
-          var similar = items.filter(function(v) {
-            return v.similar;
-          });
-          if (videos.length) {
-            if (buttons.length) {
-              filter_find.voice = buttons.map(function(b) {
-                return {
-                  title: b.text,
-                  url: b.url
-                };
-              });
-              var select_voice_url = this.getChoice(balanser).voice_url;
-              var select_voice_name = this.getChoice(balanser).voice_name;
-              var find_voice_url = buttons.find(function(v) {
-                return v.url == select_voice_url;
-              });
-              var find_voice_name = buttons.find(function(v) {
-                return v.text == select_voice_name;
-              });
-              var find_voice_active = buttons.find(function(v) {
-                return v.active;
-              }); ////console.log('b',buttons)
-              ////console.log('u',find_voice_url)
-              ////console.log('n',find_voice_name)
-              ////console.log('a',find_voice_active)
-              if (find_voice_url && !find_voice_url.active) {
-                //console.log('Alpac', 'go to voice', find_voice_url);
-                this.replaceChoice({
-                  voice: buttons.indexOf(find_voice_url),
-                  voice_name: find_voice_url.text
-                });
-                this.request(find_voice_url.url);
-              } else if (find_voice_name && !find_voice_name.active) {
-                //console.log('Alpac', 'go to voice', find_voice_name);
-                this.replaceChoice({
-                  voice: buttons.indexOf(find_voice_name),
-                  voice_name: find_voice_name.text
-                });
-                this.request(find_voice_name.url);
-              } else {
-                if (find_voice_active) {
-                  this.replaceChoice({
-                    voice: buttons.indexOf(find_voice_active),
-                    voice_name: find_voice_active.text
-                  });
-                }
-                this.display(videos);
-              }
-            } else {
-              this.replaceChoice({
-                voice: 0,
-                voice_url: '',
-                voice_name: ''
-              });
-              this.display(videos);
-            }
-          } else if (items.length) {
-            if (similar.length) {
-              this.similars(similar);
-              this.activity.loader(false);
-            } else { //this.activity.loader(true)
-              filter_find.season = items.map(function(s) {
-                return {
-                  title: s.text,
-                  url: s.url
-                };
-              });
-              var select_season = this.getChoice(balanser).season;
-              var season = filter_find.season[select_season];
-              if (!season) season = filter_find.season[0];
-              //console.log('Alpac', 'go to season', season);
-              this.request(season.url);
-            }
-          } else {
-            this.doesNotAnswer(json);
-          }
-        }
-      } catch (e) {
-        //console.log('Alpac', 'error', e.stack);
-        this.doesNotAnswer(e);
-      }
-    };
-    this.similars = function(json) {
-      var _this6 = this;
-      scroll.clear();
-      json.forEach(function(elem) {
-        elem.title = elem.text;
-        elem.info = '';
-        var info = [];
-        var year = ((elem.start_date || elem.year || object.movie.release_date || object.movie.first_air_date || '') + '').slice(0, 4);
-        if (year) info.push(year);
-        if (elem.details) info.push(elem.details);
-        var name = elem.title || elem.text;
-        elem.title = name;
-        elem.time = elem.time || '';
-        elem.info = info.join('<span class="online-prestige-split">●</span>');
-        var item = Lampa.Template.get('lampac_prestige_folder', elem);
-		if (elem.img) {
-		  var image = $('<img style="height: 7em; width: 7em; border-radius: 0.3em;"/>');
-		  item.find('.online-prestige__folder').empty().append(image);
 
-		  if (elem.img !== undefined) {
-		    if (elem.img.charAt(0) === '/')
-		      elem.img = Defined.localhost + elem.img.substring(1);
-		    if (elem.img.indexOf('/proxyimg') !== -1)
-		      elem.img = account(elem.img);
-		  }
+        // Жанры TMDB для полок
+        genres: {
+            movie: [
+                { id: 28,    key: 'nfx_g_action' },
+                { id: 35,    key: 'nfx_g_comedy' },
+                { id: 53,    key: 'nfx_g_thriller' },
+                { id: 18,    key: 'nfx_g_drama' },
+                { id: 27,    key: 'nfx_g_horror' },
+                { id: 878,   key: 'nfx_g_scifi' },
+                { id: 16,    key: 'nfx_g_animation' },
+                { id: 99,    key: 'nfx_g_documentary' },
+                { id: 10749, key: 'nfx_g_romance' },
+                { id: 80,    key: 'nfx_g_crime' },
+                { id: 12,    key: 'nfx_g_adventure' },
+                { id: 14,    key: 'nfx_g_fantasy' }
+            ]
+        },
 
-		  Lampa.Utils.imgLoad(image, elem.img);
-		}
-        item.on('hover:enter', function() {
-          _this6.reset();
-          _this6.request(elem.url);
-        }).on('hover:focus', function(e) {
-          last = e.target;
-          scroll.update($(e.target), true);
-        });
-        scroll.append(item);
-      });
-	  this.filter({
-        season: filter_find.season.map(function(s) {
-          return s.title;
-        }),
-        voice: filter_find.voice.map(function(b) {
-          return b.title;
-        })
-      }, this.getChoice());
-      Lampa.Controller.enable('content');
-    };
-    this.getChoice = function(for_balanser) {
-      var data = Lampa.Storage.cache('online_choice_' + (for_balanser || balanser), 3000, {});
-      var save = data[object.movie.id] || {};
-      Lampa.Arrays.extend(save, {
-        season: 0,
-        voice: 0,
-        voice_name: '',
-        voice_id: 0,
-        episodes_view: {},
-        movie_view: ''
-      });
-      return save;
-    };
-    this.saveChoice = function(choice, for_balanser) {
-      var data = Lampa.Storage.cache('online_choice_' + (for_balanser || balanser), 3000, {});
-      data[object.movie.id] = choice;
-      Lampa.Storage.set('online_choice_' + (for_balanser || balanser), data);
-      this.updateBalanser(for_balanser || balanser);
-    };
-    this.replaceChoice = function(choice, for_balanser) {
-      var to = this.getChoice(for_balanser);
-      Lampa.Arrays.extend(to, choice, true);
-      this.saveChoice(to, for_balanser);
-    };
-    this.clearImages = function() {
-      images.forEach(function(img) {
-        img.onerror = function() {};
-        img.onload = function() {};
-        img.src = '';
-      });
-      images = [];
-    };
-    /**
-     * Очистить список файлов
-     */
-    this.reset = function() {
-      last = false;
-      clearInterval(balanser_timer);
-      network.clear();
-      this.clearImages();
-      scroll.render().find('.empty').remove();
-      scroll.clear();
-      scroll.reset();
-      scroll.body().append(Lampa.Template.get('lampac_content_loading'));
-    };
-    /**
-     * Загрузка
-     */
-    this.loading = function(status) {
-      if (status) this.activity.loader(true);
-      else {
-        this.activity.loader(false);
-        this.activity.toggle();
-      }
-    };
-    /**
-     * Построить фильтр
-     */
-    this.filter = function(filter_items, choice) {
-      var _this7 = this;
-      var select = [];
-      var add = function add(type, title) {
-        var need = _this7.getChoice();
-        var items = filter_items[type];
-        var subitems = [];
-        var value = need[type];
-        items.forEach(function(name, i) {
-          subitems.push({
-            title: name,
-            selected: value == i,
-            index: i
-          });
-        });
-        select.push({
-          title: title,
-          subtitle: items[value],
-          items: subitems,
-          stype: type
-        });
-      };
-      filter_items.source = filter_sources;
-      select.push({
-        title: Lampa.Lang.translate('torrent_parser_reset'),
-        reset: true
-      });
-      this.saveChoice(choice);
-      if (filter_items.voice && filter_items.voice.length) add('voice', Lampa.Lang.translate('torrent_parser_voice'));
-      if (filter_items.season && filter_items.season.length) add('season', Lampa.Lang.translate('torrent_serial_season'));
-      filter.set('filter', select);
-      filter.set('sort', filter_sources.map(function(e) {
-        return {
-          title: sources[e].name,
-          source: e,
-          selected: e == balanser,
-          ghost: !sources[e].show
-        };
-      }));
-      this.selected(filter_items);
-    };
-    /**
-     * Показать что выбрано в фильтре
-     */
-    this.selected = function(filter_items) {
-      var need = this.getChoice(),
-        select = [];
-      for (var i in need) {
-        if (filter_items[i] && filter_items[i].length) {
-          if (i == 'voice') {
-            select.push(filter_translate[i] + ': ' + filter_items[i][need[i]]);
-          } else if (i !== 'source') {
-            if (filter_items.season.length >= 1) {
-              select.push(filter_translate.season + ': ' + filter_items[i][need[i]]);
-            }
-          }
-        }
-      }
-      filter.chosen('filter', select);
-      filter.chosen('sort', [sources[balanser].name]);
-    };
-    this.getEpisodes = function(season, call) {
-      var episodes = [];
-	  var tmdb_id = object.movie.id;
-	  if (['cub', 'tmdb'].indexOf(object.movie.source || 'tmdb') == -1) 
-        tmdb_id = object.movie.tmdb_id;
-      if (typeof tmdb_id == 'number' && object.movie.name) {
-		  Lampa.Api.sources.tmdb.get('tv/' + tmdb_id + '/season/' + season, {}, function(data){
-			  episodes = data.episodes || [];
-			  
-			  call(episodes);
-		  }, function(){
-			  call(episodes);
-		  })
-      } else call(episodes);
-    };
-    this.watched = function(set) {
-      var file_id = Lampa.Utils.hash(object.movie.number_of_seasons ? object.movie.original_name : object.movie.original_title);
-      var watched = Lampa.Storage.cache('online_watched_last', 5000, {});
-      if (set) {
-        if (!watched[file_id]) watched[file_id] = {};
-        Lampa.Arrays.extend(watched[file_id], set, true);
-        Lampa.Storage.set('online_watched_last', watched);
-        this.updateWatched();
-      } else {
-        return watched[file_id];
-      }
-    };
-    this.updateWatched = function() {
-      var watched = this.watched();
-      var body = scroll.body().find('.online-prestige-watched .online-prestige-watched__body').empty();
-      if (watched) {
-        var line = [];
-        if (watched.balanser_name) line.push(watched.balanser_name);
-        if (watched.voice_name) line.push(watched.voice_name);
-        if (watched.season) line.push(Lampa.Lang.translate('torrent_serial_season') + ' ' + watched.season);
-        if (watched.episode) line.push(Lampa.Lang.translate('torrent_serial_episode') + ' ' + watched.episode);
-        line.forEach(function(n) {
-          body.append('<span>' + n + '</span>');
-        });
-      } else body.append('<span>' + Lampa.Lang.translate('lampac_no_watch_history') + '</span>');
-    };
-    /**
-     * Отрисовка файлов
-     */
-    this.draw = function(items) {
-      var _this8 = this;
-      var params = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
-      if (!items.length) return this.empty();
-      scroll.clear();
-      if(!object.balanser)scroll.append(Lampa.Template.get('lampac_prestige_watched', {}));
-      this.updateWatched();
-      this.getEpisodes(items[0].season, function(episodes) {
-        var viewed = Lampa.Storage.cache('online_view', 5000, []);
-        var serial = object.movie.name ? true : false;
-        var choice = _this8.getChoice();
-        var fully = window.innerWidth > 480;
-        var scroll_to_element = false;
-        var scroll_to_mark = false;
-        items.forEach(function(element, index) {
-          var episode = serial && episodes.length && !params.similars ? episodes.find(function(e) {
-            return e.episode_number == element.episode;
-          }) : false;
-          var episode_num = element.episode || index + 1;
-          var episode_last = choice.episodes_view[element.season];
-          var voice_name = choice.voice_name || (filter_find.voice[0] ? filter_find.voice[0].title : false) || element.voice_name || (serial ? 'Неизвестно' : element.text) || 'Неизвестно';
-          if (element.quality) {
-            element.qualitys = element.quality;
-            element.quality = Lampa.Arrays.getKeys(element.quality)[0];
-          }
-          Lampa.Arrays.extend(element, {
-            voice_name: voice_name,
-            info: voice_name.length > 60 ? voice_name.substr(0, 60) + '...' : voice_name,
-            quality: '',
-            time: Lampa.Utils.secondsToTime((episode ? episode.runtime : object.movie.runtime) * 60, true)
-          });
-          var hash_timeline = Lampa.Utils.hash(element.season ? [element.season, element.season > 10 ? ':' : '', element.episode, object.movie.original_title].join('') : object.movie.original_title);
-          var hash_behold = Lampa.Utils.hash(element.season ? [element.season, element.season > 10 ? ':' : '', element.episode, object.movie.original_title, element.voice_name].join('') : object.movie.original_title + element.voice_name);
-          var data = {
-            hash_timeline: hash_timeline,
-            hash_behold: hash_behold
-          };
-          var info = [];
-          if (element.season) {
-            element.translate_episode_end = _this8.getLastEpisode(items);
-            element.translate_voice = element.voice_name;
-          }
-          if (element.text && !episode) element.title = element.text;
-          element.timeline = Lampa.Timeline.view(hash_timeline);
-          if (episode) {
-            element.title = episode.name;
-            if (element.info.length < 30 && episode.vote_average) info.push(Lampa.Template.get('lampac_prestige_rate', {
-              rate: parseFloat(episode.vote_average + '').toFixed(1)
-            }, true));
-            if (episode.air_date && fully) info.push(Lampa.Utils.parseTime(episode.air_date).full);
-          } else if (object.movie.release_date && fully) {
-            info.push(Lampa.Utils.parseTime(object.movie.release_date).full);
-          }
-          if (!serial && object.movie.tagline && element.info.length < 30) info.push(object.movie.tagline);
-          if (element.info) info.push(element.info);
-          if (info.length) element.info = info.map(function(i) {
-            return '<span>' + i + '</span>';
-          }).join('<span class="online-prestige-split">●</span>');
-          var html = Lampa.Template.get('lampac_prestige_full', element);
-          var loader = html.find('.online-prestige__loader');
-          var image = html.find('.online-prestige__img');
-		  if(object.balanser) image.hide();
-          if (!serial) {
-            if (choice.movie_view == hash_behold) scroll_to_element = html;
-          } else if (typeof episode_last !== 'undefined' && episode_last == episode_num) {
-            scroll_to_element = html;
-          }
-          if (serial && !episode) {
-            image.append('<div class="online-prestige__episode-number">' + ('0' + (element.episode || index + 1)).slice(-2) + '</div>');
-            loader.remove();
-          }
-		  else if (!serial && object.movie.backdrop_path == 'undefined') loader.remove();
-          else {
-            var img = html.find('img')[0];
-            img.onerror = function() {
-              img.src = './img/img_broken.svg';
-            };
-            img.onload = function() {
-              image.addClass('online-prestige__img--loaded');
-              loader.remove();
-              if (serial) image.append('<div class="online-prestige__episode-number">' + ('0' + (element.episode || index + 1)).slice(-2) + '</div>');
-            };
-            img.src = Lampa.TMDB.image('t/p/w300' + (episode ? episode.still_path : object.movie.backdrop_path));
-            images.push(img);
-			element.thumbnail = img.src
-          }
-          html.find('.online-prestige__timeline').append(Lampa.Timeline.render(element.timeline));
-          if (viewed.indexOf(hash_behold) !== -1) {
-            scroll_to_mark = html;
-            html.find('.online-prestige__img').append('<div class="online-prestige__viewed">' + Lampa.Template.get('icon_viewed', {}, true) + '</div>');
-          }
-          element.mark = function() {
-            viewed = Lampa.Storage.cache('online_view', 5000, []);
-            if (viewed.indexOf(hash_behold) == -1) {
-              viewed.push(hash_behold);
-              Lampa.Storage.set('online_view', viewed);
-              if (html.find('.online-prestige__viewed').length == 0) {
-                html.find('.online-prestige__img').append('<div class="online-prestige__viewed">' + Lampa.Template.get('icon_viewed', {}, true) + '</div>');
-              }
-            }
-            choice = _this8.getChoice();
-            if (!serial) {
-              choice.movie_view = hash_behold;
-            } else {
-              choice.episodes_view[element.season] = episode_num;
-            }
-            _this8.saveChoice(choice);
-            var voice_name_text = choice.voice_name || element.voice_name || element.title;
-            if (voice_name_text.length > 30) voice_name_text = voice_name_text.slice(0, 30) + '...';
-            _this8.watched({
-              balanser: balanser,
-              balanser_name: Lampa.Utils.capitalizeFirstLetter(sources[balanser] ? sources[balanser].name.split(' ')[0] : balanser),
-              voice_id: choice.voice_id,
-              voice_name: voice_name_text,
-              episode: element.episode,
-              season: element.season
-            });
-          };
-          element.unmark = function() {
-            viewed = Lampa.Storage.cache('online_view', 5000, []);
-            if (viewed.indexOf(hash_behold) !== -1) {
-              Lampa.Arrays.remove(viewed, hash_behold);
-              Lampa.Storage.set('online_view', viewed);
-              Lampa.Storage.remove('online_view', hash_behold);
-              html.find('.online-prestige__viewed').remove();
-            }
-          };
-          element.timeclear = function() {
-            element.timeline.percent = 0;
-            element.timeline.time = 0;
-            element.timeline.duration = 0;
-            Lampa.Timeline.update(element.timeline);
-          };
-          html.on('hover:enter', function() {
-            if (object.movie.id) Lampa.Favorite.add('history', object.movie, 100);
-            if (params.onEnter) params.onEnter(element, html, data);
-          }).on('hover:focus', function(e) {
-            last = e.target;
-            if (params.onFocus) params.onFocus(element, html, data);
-            scroll.update($(e.target), true);
-          });
-          if (params.onRender) params.onRender(element, html, data);
-          _this8.contextMenu({
-            html: html,
-            element: element,
-            onFile: function onFile(call) {
-              if (params.onContextMenu) params.onContextMenu(element, html, data, call);
-            },
-            onClearAllMark: function onClearAllMark() {
-              items.forEach(function(elem) {
-                elem.unmark();
-              });
-            },
-            onClearAllTime: function onClearAllTime() {
-              items.forEach(function(elem) {
-                elem.timeclear();
-              });
-            }
-          });
-          scroll.append(html);
-        });
-        if (serial && episodes.length > items.length && !params.similars) {
-          var left = episodes.slice(items.length);
-          left.forEach(function(episode) {
-            var info = [];
-            if (episode.vote_average) info.push(Lampa.Template.get('lampac_prestige_rate', {
-              rate: parseFloat(episode.vote_average + '').toFixed(1)
-            }, true));
-            if (episode.air_date) info.push(Lampa.Utils.parseTime(episode.air_date).full);
-            var air = new Date((episode.air_date + '').replace(/-/g, '/'));
-            var now = Date.now();
-            var day = Math.round((air.getTime() - now) / (24 * 60 * 60 * 1000));
-            var txt = Lampa.Lang.translate('full_episode_days_left') + ': ' + day;
-            var html = Lampa.Template.get('lampac_prestige_full', {
-              time: Lampa.Utils.secondsToTime((episode ? episode.runtime : object.movie.runtime) * 60, true),
-              info: info.length ? info.map(function(i) {
-                return '<span>' + i + '</span>';
-              }).join('<span class="online-prestige-split">●</span>') : '',
-              title: episode.name,
-              quality: day > 0 ? txt : ''
-            });
-            var loader = html.find('.online-prestige__loader');
-            var image = html.find('.online-prestige__img');
-            var season = items[0] ? items[0].season : 1;
-            html.find('.online-prestige__timeline').append(Lampa.Timeline.render(Lampa.Timeline.view(Lampa.Utils.hash([season, episode.episode_number, object.movie.original_title].join('')))));
-            var img = html.find('img')[0];
-            if (episode.still_path) {
-              img.onerror = function() {
-                img.src = './img/img_broken.svg';
-              };
-              img.onload = function() {
-                image.addClass('online-prestige__img--loaded');
-                loader.remove();
-                image.append('<div class="online-prestige__episode-number">' + ('0' + episode.episode_number).slice(-2) + '</div>');
-              };
-              img.src = Lampa.TMDB.image('t/p/w300' + episode.still_path);
-              images.push(img);
-            } else {
-              loader.remove();
-              image.append('<div class="online-prestige__episode-number">' + ('0' + episode.episode_number).slice(-2) + '</div>');
-            }
-            html.on('hover:focus', function(e) {
-              last = e.target;
-              scroll.update($(e.target), true);
-            });
-            html.css('opacity', '0.5');
-            scroll.append(html);
-          });
-        }
-        if (scroll_to_element) {
-          last = scroll_to_element[0];
-        } else if (scroll_to_mark) {
-          last = scroll_to_mark[0];
-        }
-        Lampa.Controller.enable('content');
-      });
-    };
-    /**
-     * Меню
-     */
-    this.contextMenu = function(params) {
-      params.html.on('hover:long', function() {
-        function show(extra) {
-          var enabled = Lampa.Controller.enabled().name;
-          var menu = [];
-          if (Lampa.Platform.is('webos')) {
-            menu.push({
-              title: Lampa.Lang.translate('player_lauch') + ' - Webos',
-              player: 'webos'
-            });
-          }
-          if (Lampa.Platform.is('android')) {
-            menu.push({
-              title: Lampa.Lang.translate('player_lauch') + ' - Android',
-              player: 'android'
-            });
-          }
-          menu.push({
-            title: Lampa.Lang.translate('player_lauch') + ' - Lampa',
-            player: 'lampa'
-          });
-          menu.push({
-            title: Lampa.Lang.translate('lampac_video'),
-            separator: true
-          });
-          menu.push({
-            title: Lampa.Lang.translate('torrent_parser_label_title'),
-            mark: true
-          });
-          menu.push({
-            title: Lampa.Lang.translate('torrent_parser_label_cancel_title'),
-            unmark: true
-          });
-          menu.push({
-            title: Lampa.Lang.translate('time_reset'),
-            timeclear: true
-          });
-          if (extra) {
-            menu.push({
-              title: Lampa.Lang.translate('copy_link'),
-              copylink: true
-            });
-          }
-          if (window.lampac_online_context_menu)
-            window.lampac_online_context_menu.push(menu, extra, params);
-          menu.push({
-            title: Lampa.Lang.translate('more'),
-            separator: true
-          });
-          if (Lampa.Account.logged() && params.element && typeof params.element.season !== 'undefined' && params.element.translate_voice) {
-            menu.push({
-              title: Lampa.Lang.translate('lampac_voice_subscribe'),
-              subscribe: true
-            });
-          }
-          menu.push({
-            title: Lampa.Lang.translate('lampac_clear_all_marks'),
-            clearallmark: true
-          });
-          menu.push({
-            title: Lampa.Lang.translate('lampac_clear_all_timecodes'),
-            timeclearall: true
-          });
-          Lampa.Select.show({
-            title: Lampa.Lang.translate('title_action'),
-            items: menu,
-            onBack: function onBack() {
-              Lampa.Controller.toggle(enabled);
-            },
-            onSelect: function onSelect(a) {
-              if (a.mark) params.element.mark();
-              if (a.unmark) params.element.unmark();
-              if (a.timeclear) params.element.timeclear();
-              if (a.clearallmark) params.onClearAllMark();
-              if (a.timeclearall) params.onClearAllTime();
-              if (window.lampac_online_context_menu)
-                window.lampac_online_context_menu.onSelect(a, params);
-              Lampa.Controller.toggle(enabled);
-              if (a.player) {
-                Lampa.Player.runas(a.player);
-                params.html.trigger('hover:enter');
-              }
-              if (a.copylink) {
-                if (extra.quality) {
-                  var qual = [];
-                  for (var i in extra.quality) {
-                    qual.push({
-                      title: i,
-                      file: extra.quality[i]
-                    });
-                  }
-                  Lampa.Select.show({
-                    title: Lampa.Lang.translate('settings_server_links'),
-                    items: qual,
-                    onBack: function onBack() {
-                      Lampa.Controller.toggle(enabled);
-                    },
-                    onSelect: function onSelect(b) {
-                      Lampa.Utils.copyTextToClipboard(b.file, function() {
-                        Lampa.Noty.show(Lampa.Lang.translate('copy_secuses'));
-                      }, function() {
-                        Lampa.Noty.show(Lampa.Lang.translate('copy_error'));
-                      });
-                    }
-                  });
-                } else {
-                  Lampa.Utils.copyTextToClipboard(extra.file, function() {
-                    Lampa.Noty.show(Lampa.Lang.translate('copy_secuses'));
-                  }, function() {
-                    Lampa.Noty.show(Lampa.Lang.translate('copy_error'));
-                  });
-                }
-              }
-              if (a.subscribe) {
-                Lampa.Account.subscribeToTranslation({
-                  card: object.movie,
-                  season: params.element.season,
-                  episode: params.element.translate_episode_end,
-                  voice: params.element.translate_voice
-                }, function() {
-                  Lampa.Noty.show(Lampa.Lang.translate('lampac_voice_success'));
-                }, function() {
-                  Lampa.Noty.show(Lampa.Lang.translate('lampac_voice_error'));
-                });
-              }
-            }
-          });
-        }
-        params.onFile(show);
-      }).on('hover:focus', function() {
-        if (Lampa.Helper) Lampa.Helper.show('online_file', Lampa.Lang.translate('helper_online_file'), params.html);
-      });
-    };
-    // renderAuthCard shows the scan-to-login QR card when the gate returns an
-    // accsdb auth wall carrying a TG pending code (unauthenticated user — the
-    // source list is blocked server-side). Renders the QR + code + bot link,
-    // then polls /tg/auth/status until the bot approves and reloads the
-    // activity so the now-authorized source list loads. Reuses balanser_timer
-    // so the component's existing cleanup (cancel/change/destroy) clears it.
-    function renderAuthCard(er, ctx) {
-      var bot = er.bot || '';
-      var link = er.deep_link ? er.deep_link.replace(/^https?:\/\//, '') : '';
-      var instr = 'Для просмотра требуется авторизация. Отсканируйте QR или введите код в телеграм-боте ' + bot + (link ? (' или по ссылке ' + link) : '');
-      var inner = '<div style="text-align:center;max-width:30em;margin:0 auto">' +
-        (er.qr ? '<img src="' + er.qr + '" alt="QR" style="width:13em;height:13em;border-radius:.6em;background:#fff;padding:.4em;display:block;margin:0 auto 1.2em"/>' : '') +
-        '<p style="font-size:1.05em;line-height:1.5;opacity:.85;margin-bottom:1em">' + instr + '</p>' +
-        '<p style="font-size:2.4em;font-weight:bold;letter-spacing:.12em">' + er.code + '</p>' +
-        '</div>';
+        // Сколько полок отдаём за один «шаг» подгрузки
+        parts_limit: 5,
 
-      var pollTimer = null;
-      function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
-      function closeModal() { try { if ($('.modal').length) $('.modal').remove(); } catch (e) {} }
+        // Кеш ответов TMDB, минуты
+        cache: {
+            short: 60 * 6,
+            long: 60 * 24 * 3
+        }
+    };
 
-      // Centered modal (matches the Showy-style auth card) — keep the inline
-      // render as a fallback if Lampa.Modal is unavailable on some build.
-      if (Lampa.Modal && Lampa.Modal.open) {
-        closeModal();
-        Lampa.Modal.open({
-          title: '',
-          align: 'center',
-          zIndex: 300,
-          html: $(inner),
-          onBack: function () {
-            stopPoll();
-            closeModal();
-            try { if (Lampa.Activity && Lampa.Activity.backward) Lampa.Activity.backward(); } catch (e) {}
-          }
+    /* ---------- src/lang.js ---------- */
+    /**
+     * Локализация. Русский / английский / украинский.
+     */
+    function langInit(){
+        Lampa.Lang.add({
+            nfx_title:            { ru: 'Netflix UI',            en: 'Netflix UI',            uk: 'Netflix UI' },
+            nfx_settings_descr:   { ru: 'Интерфейс в стиле Netflix', en: 'Netflix-style interface', uk: 'Інтерфейс у стилі Netflix' },
+
+            nfx_param_theme:      { ru: 'Тема Netflix',          en: 'Netflix theme',         uk: 'Тема Netflix' },
+            nfx_param_theme_d:    { ru: 'Перекрашивает весь интерфейс Lampa: тёмный фон, красные акценты, плоские карточки', en: 'Repaints the whole Lampa UI: dark background, red accents, flat cards', uk: 'Перефарбовує весь інтерфейс Lampa' },
+
+            nfx_param_home:       { ru: 'Главная в стиле Netflix', en: 'Netflix home screen',  uk: 'Головна у стилі Netflix' },
+            nfx_param_home_d:     { ru: 'Заменяет главную страницу на баннер + полки', en: 'Replaces the home page with billboard + rows', uk: 'Замінює головну сторінку' },
+
+            nfx_param_billboard:  { ru: 'Баннер сверху',          en: 'Top billboard',         uk: 'Банер зверху' },
+            nfx_param_billboard_d:{ ru: 'Большой промо-блок с трейлером-постером, описанием и кнопками', en: 'Large promo block with artwork, description and buttons', uk: 'Великий промо-блок' },
+
+            nfx_param_rotate:     { ru: 'Автосмена баннера',      en: 'Billboard autoplay',    uk: 'Автозміна банера' },
+            nfx_param_shape:      { ru: 'Форма карточек',         en: 'Card shape',            uk: 'Форма карток' },
+            nfx_param_shape_wide: { ru: 'Широкие 16:9',           en: 'Wide 16:9',             uk: 'Широкі 16:9' },
+            nfx_param_shape_post: { ru: 'Постеры 2:3',            en: 'Posters 2:3',           uk: 'Постери 2:3' },
+
+            nfx_param_titles:     { ru: 'Подписи под карточками', en: 'Titles under cards',    uk: 'Підписи під картками' },
+
+            nfx_param_pin:        { ru: 'Сквозное листание',       en: 'Pin focused card left', uk: 'Суцільне листання' },
+            nfx_param_pin_d:      { ru: 'Активная карточка всегда у левого края, полка уезжает под неё — как в Netflix TV. Выключено — карточка центрируется', en: 'The focused card stays at the left edge and the row slides under it, like Netflix TV. Off — the card is centred', uk: 'Активна картка завжди біля лівого краю' },
+
+            nfx_param_trailer:    { ru: 'Трейлер при удержании',  en: 'Trailer on dwell',      uk: 'Трейлер при утриманні' },
+            nfx_param_trailer_d:  { ru: 'Если карточка остаётся активной дольше выбранного времени — внутри неё запускается трейлер с YouTube без элементов плеера. Тянет трафик, на телевизорах может не работать', en: 'If a card stays focused longer than the chosen delay, a YouTube trailer plays inside it with no player chrome. Uses traffic, may not work on TVs', uk: 'Якщо картка залишається активною довше — всередині запускається трейлер' },
+            nfx_param_trailer_s:  { ru: 'Звук трейлера',          en: 'Trailer sound',         uk: 'Звук трейлера' },
+            nfx_param_trailer_s_d:{ ru: 'Трейлер всегда стартует в тишине и плавно набирает громкость. Если браузер запретит звук — останется беззвучным', en: 'The trailer always starts silent and fades the volume in. If the browser blocks sound it stays silent', uk: 'Трейлер завжди стартує в тиші' },
+
+            nfx_param_prefetch:   { ru: 'Подгружать арт заранее',  en: 'Prefetch artwork',      uk: 'Завантажувати арт заздалегідь' },
+            nfx_param_prefetch_d: { ru: 'Логотипы и кадры 16:9 тянутся в фоне для соседних карточек — раскрытие происходит сразу. Выключите на медленном соединении', en: 'Logos and 16:9 stills are fetched in the background for nearby cards so expansion is instant. Turn off on a slow connection', uk: 'Логотипи та кадри 16:9 завантажуються у фоні' },
+
+            nfx_param_font:       { ru: 'Шрифт',                  en: 'Typeface',              uk: 'Шрифт' },
+            nfx_param_font_d:     { ru: 'Загружается с Google Fonts, кириллица включена. Без сети используется штатный шрифт Lampa', en: 'Loaded from Google Fonts with Cyrillic. Falls back to the stock Lampa font offline', uk: 'Завантажується з Google Fonts' },
+            nfx_font_system:      { ru: 'Как в Lampa (SegoeUI)',  en: 'Lampa default (SegoeUI)', uk: 'Як у Lampa (SegoeUI)' },
+            nfx_font_gm:          { ru: 'Golos Text + Montserrat (рекомендуется)', en: 'Golos Text + Montserrat (recommended)', uk: 'Golos Text + Montserrat (рекомендовано)' },
+            nfx_font_golos:       { ru: 'Golos Text',             en: 'Golos Text',            uk: 'Golos Text' },
+            nfx_font_manrope:     { ru: 'Manrope',                en: 'Manrope',               uk: 'Manrope' },
+            nfx_font_montserrat: { ru: 'Montserrat',             en: 'Montserrat',            uk: 'Montserrat' },
+            nfx_font_inter:       { ru: 'Inter',                   en: 'Inter',                 uk: 'Inter' },
+            nfx_font_im:          { ru: 'Inter + Montserrat',      en: 'Inter + Montserrat',    uk: 'Inter + Montserrat' },
+            nfx_font_custom:      { ru: 'Свой шрифт',              en: 'Custom',                uk: 'Свій шрифт' },
+            nfx_param_font_fam:   { ru: 'Название своего шрифта',  en: 'Custom font family',    uk: 'Назва свого шрифту' },
+            nfx_param_font_fam_d: { ru: 'Например Golos Sharp — точное имя семейства из @font-face', en: 'e.g. Golos Sharp — exact family name from @font-face', uk: 'Наприклад Golos Sharp' },
+            nfx_param_font_css:   { ru: 'URL CSS со шрифтом',      en: 'Font CSS URL',          uk: 'URL CSS зі шрифтом' },
+            nfx_param_font_css_d: { ru: 'Ссылка на css с @font-face. Можно положить файл в wwwroot Lampac', en: 'Link to a css with @font-face. You can host it in Lampac wwwroot', uk: 'Посилання на css з @font-face' },
+            nfx_param_top10:      { ru: 'Полки «Топ-10»',         en: 'Top 10 rows',           uk: 'Полиці «Топ-10»' },
+            nfx_param_host:       { ru: 'Адрес Lampac',           en: 'Lampac address',        uk: 'Адреса Lampac' },
+            nfx_param_host_d:     { ru: 'http://host:9118 — для полок каталогов Lampac. Пусто = определить автоматически', en: 'http://host:9118 — used for Lampac catalog rows. Empty = autodetect', uk: 'http://host:9118' },
+            nfx_param_lampac:     { ru: 'Полки каталогов Lampac', en: 'Lampac catalog rows',   uk: 'Полиці каталогів Lampac' },
+            nfx_param_lampac_d:   { ru: 'Добавить на главную полки из модуля Catalog (rezka, filmix, kinopub…)', en: 'Add rows from the Catalog module (rezka, filmix, kinopub…)', uk: 'Додати полиці з модуля Catalog' },
+            nfx_param_open:       { ru: 'Открыть главную Netflix', en: 'Open Netflix home',    uk: 'Відкрити головну Netflix' },
+
+            nfx_tab_home:         { ru: 'Главная',                en: 'Home',                  uk: 'Головна' },
+            nfx_tab_shows:        { ru: 'Сериалы',                en: 'Shows',                 uk: 'Серіали' },
+            nfx_tab_movies:       { ru: 'Фильмы',                 en: 'Movies',                uk: 'Фільми' },
+            nfx_tab_my:           { ru: 'Моё',                    en: 'My Netflix',            uk: 'Моє' },
+            nfx_nav_menu:         { ru: 'Меню Lampa',             en: 'Lampa menu',            uk: 'Меню Lampa' },
+            nfx_nav_profiles:     { ru: 'Профили',                en: 'Profiles',              uk: 'Профілі' },
+            nfx_param_nav:        { ru: 'Верхнее меню',           en: 'Top navigation',        uk: 'Верхнє меню' },
+            nfx_param_nav_d:      { ru: 'Панель с вкладками сверху вместо шапки Lampa. Аватар открывает меню и настройки', en: 'Top tab bar instead of the Lampa header. The avatar opens the menu and settings', uk: 'Панель із вкладками зверху' },
+            nfx_param_shape_exp:  { ru: 'Раскрывающиеся (Netflix TV)', en: 'Expanding (Netflix TV)', uk: 'Розкривні (Netflix TV)' },
+            nfx_more_all:         { ru: 'Показать все',           en: 'Show all',              uk: 'Показати все' },
+            nfx_left:             { ru: 'Осталось %s',            en: '%s left',               uk: 'Залишилось %s' },
+            nfx_min:              { ru: 'мин',                    en: 'min',                   uk: 'хв' },
+            nfx_hour:             { ru: 'ч',                      en: 'h',                     uk: 'год' },
+
+            nfx_row_continue:     { ru: 'Продолжить просмотр',    en: 'Continue Watching',     uk: 'Продовжити перегляд' },
+            nfx_row_liked:        { ru: 'Вам понравилось',        en: "Movies You've Liked",   uk: 'Вам сподобалось' },
+            nfx_row_wath:         { ru: 'Хочу посмотреть',        en: 'Want to Watch',         uk: 'Хочу подивитися' },
+            nfx_row_history:      { ru: 'История просмотров',     en: 'Viewing History',       uk: 'Історія переглядів' },
+            nfx_row_trending_tv:  { ru: 'Сериалы в тренде',       en: 'Trending Shows',        uk: 'Серіали у тренді' },
+            nfx_row_trending_movie:{ ru: 'Фильмы в тренде',       en: 'Trending Movies',       uk: 'Фільми у тренді' },
+            nfx_row_tv_air:       { ru: 'Сейчас выходят',         en: 'Currently Airing',      uk: 'Зараз виходять' },
+            nfx_row_tv_today:     { ru: 'Серии сегодня',          en: 'Airing Today',          uk: 'Серії сьогодні' },
+            nfx_row_tv_top:       { ru: 'Лучшие сериалы',         en: 'Top Rated Shows',       uk: 'Найкращі серіали' },
+            nfx_row_popular:      { ru: 'Популярное',             en: 'Popular',               uk: 'Популярне' },
+            nfx_row_mylist:       { ru: 'Мой список',             en: 'My List',               uk: 'Мій список' },
+            nfx_row_trending:     { ru: 'Сейчас в тренде',        en: 'Trending Now',          uk: 'Зараз у тренді' },
+            nfx_row_top10_movie:  { ru: 'Топ-10 фильмов сегодня', en: 'Top 10 Movies Today',   uk: 'Топ-10 фільмів сьогодні' },
+            nfx_row_top10_tv:     { ru: 'Топ-10 сериалов сегодня',en: 'Top 10 TV Shows Today', uk: 'Топ-10 серіалів сьогодні' },
+            nfx_row_new:          { ru: 'Новинки',                en: 'New Releases',          uk: 'Новинки' },
+            nfx_row_soon:         { ru: 'Скоро',                  en: 'Coming Soon',           uk: 'Незабаром' },
+            nfx_row_tv_popular:   { ru: 'Популярные сериалы',     en: 'Popular TV Shows',      uk: 'Популярні серіали' },
+            nfx_row_acclaimed:    { ru: 'Признание критиков',     en: 'Critically Acclaimed',  uk: 'Визнання критиків' },
+            nfx_row_because:      { ru: 'Похоже на',              en: 'Because you watched',   uk: 'Схоже на' },
+
+            nfx_g_action:         { ru: 'Боевики',                en: 'Action',                uk: 'Бойовики' },
+            nfx_g_comedy:         { ru: 'Комедии',                en: 'Comedies',              uk: 'Комедії' },
+            nfx_g_thriller:       { ru: 'Триллеры',               en: 'Thrillers',             uk: 'Трилери' },
+            nfx_g_drama:          { ru: 'Драмы',                  en: 'Dramas',                uk: 'Драми' },
+            nfx_g_horror:         { ru: 'Ужасы',                  en: 'Horror',                uk: 'Жахи' },
+            nfx_g_scifi:          { ru: 'Фантастика',             en: 'Sci-Fi',                uk: 'Фантастика' },
+            nfx_g_animation:      { ru: 'Мультфильмы',            en: 'Animation',             uk: 'Мультфільми' },
+            nfx_g_documentary:    { ru: 'Документальные',         en: 'Documentaries',         uk: 'Документальні' },
+            nfx_g_romance:        { ru: 'Романтика',              en: 'Romance',               uk: 'Романтика' },
+            nfx_g_crime:          { ru: 'Криминал',               en: 'Crime',                 uk: 'Кримінал' },
+            nfx_g_adventure:      { ru: 'Приключения',            en: 'Adventure',             uk: 'Пригоди' },
+            nfx_g_fantasy:        { ru: 'Фэнтези',                en: 'Fantasy',               uk: 'Фентезі' },
+
+            nfx_play:             { ru: 'Смотреть',               en: 'Play',                  uk: 'Дивитися' },
+            nfx_info:             { ru: 'Подробнее',              en: 'More Info',             uk: 'Детальніше' },
+            nfx_more:             { ru: 'Все',                    en: 'All',                   uk: 'Усі' },
+            nfx_match:            { ru: 'совпадение',             en: 'Match',                 uk: 'збіг' },
+            nfx_series:           { ru: 'Сериал',                 en: 'Series',                uk: 'Серіал' },
+            nfx_movie:            { ru: 'Фильм',                  en: 'Movie',                 uk: 'Фільм' },
+            nfx_empty:            { ru: 'Не удалось загрузить каталог', en: 'Failed to load the catalog', uk: 'Не вдалося завантажити каталог' },
+            nfx_empty_hint:       { ru: 'Проверьте подключение к сети и адрес Lampac', en: 'Check your network connection and the Lampac address', uk: 'Перевірте підключення та адресу Lampac' },
+            nfx_empty_my:         { ru: 'Здесь пока пусто',          en: 'Nothing here yet',      uk: 'Тут поки порожньо' },
+            nfx_empty_my_hint:    { ru: 'Добавляйте фильмы и сериалы в «Мой список» — они появятся на этой вкладке вместе с историей просмотров', en: 'Add movies and shows to My List — they will show up on this tab along with your viewing history', uk: 'Додавайте фільми та серіали до «Мого списку»' }
         });
-      } else {
-        var card = $('<div class="online-empty" style="max-width:32em;margin:1.5em auto;padding:2em;background:rgba(40,40,46,0.96);border-radius:1em">' + inner + '</div>');
-        scroll.clear();
-        scroll.append(card);
-        if (ctx && ctx.loading) ctx.loading(false);
-      }
+    }
 
-      // Poll for approval; on success close the card and reload the activity so
-      // the now-authorized source list loads. Mirror to balanser_timer so the
-      // component's existing cleanup (cancel/change/destroy) also clears it.
-      pollTimer = setInterval(function () {
+    /* ---------- src/utils.js ---------- */
+    /**
+     * Утилиты плагина.
+     */
+
+    /** Значения настроек по умолчанию (нужны до регистрации SettingsApi) */
+    var NFX_DEFAULTS = {
+        nfx_theme: true,
+        nfx_home: true,
+        nfx_nav: true,
+        nfx_billboard: true,
+        nfx_rotate: '12',
+        nfx_shape: 'expand',
+        nfx_titles: false,
+        nfx_top10: true,
+        nfx_prefetch: true,
+        nfx_trailer: '0',
+        nfx_trailer_sound: false,
+        nfx_pin: true,
+        nfx_lampac_rows: true,
+        nfx_host: '',
+        nfx_font: 'golos-montserrat',
+        nfx_font_family: '',
+        nfx_font_css: ''
+    };
+
+    /**
+     * Прочитать настройку с безопасным фолбэком.
+     * @param {string} name
+     * @return {*}
+     */
+    function pref(name){
+        var fallback = NFX_DEFAULTS[name];
+
         try {
-          var uid = Lampa.Storage.get('lampac_unic_id', '');
-          var q = 'uid=' + encodeURIComponent(uid);
-          // Recovery anchors beyond the pending code: the precise device fp
-          // and the CUB session token. A user who just re-entered CUB
-          // (Настройки → CUB) gets picked up by the server's CUB anchor on
-          // the very next poll instead of having to redo the bot code.
-          if (device_fp) q += '&fp=' + encodeURIComponent(device_fp);
-          try {
-            var acc = JSON.parse(localStorage.getItem('account') || '{}');
-            if (acc && typeof acc.token === 'string' && acc.token) q += '&cub=' + encodeURIComponent(acc.token);
-          } catch (e) {}
-          var x = new XMLHttpRequest();
-          x.open('GET', Defined.localhost + 'tg/auth/status?' + q, true);
-          x.onload = function () {
-            try {
-              var r = JSON.parse(x.responseText);
-              if (r && r.authorized) {
-                stopPoll();
-                if (r.token) { try { localStorage.setItem('lampac_auth_token', r.token); } catch (e) {} }
-                // Session was booted with the limited unauthenticated plugin
-                // set — pull the tokenized full bundle in now (on.js hook).
-                try { if (r.token && window.alcopac_upgrade) window.alcopac_upgrade(r.token); } catch (e) {}
-                try { localStorage.removeItem('activity'); } catch (e) {}
-                closeModal();
-                if (Lampa.Activity && typeof Lampa.Activity.replace === 'function') Lampa.Activity.replace();
-                else window.location.reload();
-              }
-            } catch (e) {}
-          };
-          x.send();
-        } catch (e) {}
-      }, 3000);
-      balanser_timer = pollTimer;
-    }
-    /**
-     * Показать пустой результат
-     */
-    this.empty = function() {
-      var html = Lampa.Template.get('lampac_does_not_answer', {});
-      html.find('.online-empty__buttons').remove();
-      html.find('.online-empty__title').text(Lampa.Lang.translate('empty_title_two'));
-      html.find('.online-empty__time').text(Lampa.Lang.translate('empty_text'));
-      scroll.clear();
-      scroll.append(html);
-      this.loading(false);
-    };
-    this.noConnectToServer = function(er) {
-      // Source-list auth wall: the gate blocks /lite/events for an
-      // unauthenticated user and returns accsdb + a TG pending code. Render the
-      // scan-to-login QR card instead of the plain "title_error" banner.
-      if (er && er.accsdb && er.code) { renderAuthCard(er, this); return; }
-      var html = Lampa.Template.get('lampac_does_not_answer', {});
-      html.find('.online-empty__buttons').remove();
-      html.find('.online-empty__title').text(Lampa.Lang.translate('title_error'));
-      html.find('.online-empty__time').text(er && er.accsdb ? er.msg : Lampa.Lang.translate('lampac_does_not_answer_text').replace('{balanser}', (sources[balanser] ? sources[balanser].name : balanser) || ''));
-      scroll.clear();
-      scroll.append(html);
-      this.loading(false);
-    };
-    this.doesNotAnswer = function(er) {
-      var _this9 = this;
-      this.reset();
-      // Auth wall (accsdb + pending code) can also surface on a per-balancer
-      // request — render the same scan-to-login QR card.
-      if (er && er.accsdb && er.code) { renderAuthCard(er, this); return; }
-      var html = Lampa.Template.get('lampac_does_not_answer', {
-        balanser: balanser
-      });
-      if(er && er.accsdb) html.find('.online-empty__title').html(er.msg);
-	  
-      var tic = er && er.accsdb ? 10 : 5;
-      html.find('.cancel').on('hover:enter', function() {
-        clearInterval(balanser_timer);
-      });
-      html.find('.change').on('hover:enter', function() {
-        clearInterval(balanser_timer);
-        filter.render().find('.filter--sort').trigger('hover:enter');
-      });
-      scroll.clear();
-      scroll.append(html);
-      this.loading(false);
-      balanser_timer = setInterval(function() {
-        tic--;
-        html.find('.timeout').text(tic);
-        if (tic == 0) {
-          clearInterval(balanser_timer);
-          var keys = Lampa.Arrays.getKeys(sources);
-          var indx = keys.indexOf(balanser);
-          var next = keys[indx + 1];
-          if (!next) next = keys[0];
-          balanser = next;
-          if (Lampa.Activity.active().activity == _this9.activity) _this9.changeBalanser(balanser);
+            var value = Lampa.Storage.get(name, fallback + '');
+
+            return typeof value === 'undefined' ? fallback : value;
         }
-      }, 1000);
-    };
-    this.getLastEpisode = function(items) {
-      var last_episode = 0;
-      items.forEach(function(e) {
-        if (typeof e.episode !== 'undefined') last_episode = Math.max(last_episode, parseInt(e.episode));
-      });
-      return last_episode;
-    };
+        catch(e){
+            return fallback;
+        }
+    }
+
     /**
-     * Начать навигацию по файлам
+     * Не является ли строка неподставленным шаблоном lampac ({localhost}).
+     * @param {string} value
+     * @return {boolean}
      */
-    this.start = function() {
-      if (Lampa.Activity.active().activity !== this.activity) return;
-      if (!initialized) {
-        initialized = true;
-        this.initialize();
-      }
-      Lampa.Background.immediately(Lampa.Utils.cardImgBackgroundBlur(object.movie));
-      Lampa.Controller.add('content', {
-        toggle: function toggle() {
-          Lampa.Controller.collectionSet(scroll.render(), files.render());
-          Lampa.Controller.collectionFocus(last || false, scroll.render());
-        },
-        gone: function gone() {
-          clearTimeout(balanser_timer);
-        },
-        up: function up() {
-          if (Navigator.canmove('up')) {
-            Navigator.move('up');
-          } else Lampa.Controller.toggle('head');
-        },
-        down: function down() {
-          Navigator.move('down');
-        },
-        right: function right() {
-          if (Navigator.canmove('right')) Navigator.move('right');
-          else filter.show(Lampa.Lang.translate('title_filter'), 'filter');
-        },
-        left: function left() {
-          if (Navigator.canmove('left')) Navigator.move('left');
-          else Lampa.Controller.toggle('menu');
-        },
-        back: this.back.bind(this)
-      });
-      Lampa.Controller.toggle('content');
-    };
-    this.render = function() {
-      return files.render();
-    };
-    this.back = function() {
-      Lampa.Activity.backward();
-    };
-    this.pause = function() {};
-    this.stop = function() {};
-    this.destroy = function() {
-      network.clear();
-      this.clearImages();
-      files.destroy();
-      scroll.destroy();
-      clearInterval(balanser_timer);
-      clearTimeout(life_wait_timer);
-    };
-  }
-  
-  function addSourceSearch(spiderName, spiderUri) {
-    var network = new Lampa.Reguest();
+    function filled(value){
+        return !!value && value.indexOf('{') === -1 && value.indexOf('}') === -1;
+    }
 
-    var source = {
-      title: spiderName,
-      search: function(params, oncomplite) {
-        function searchComplite(links) {
-          var keys = Lampa.Arrays.getKeys(links);
+    /**
+     * Определить адрес Lampac и токен.
+     * Приоритет: настройка -> подстановка lampac -> URL самого плагина -> online.js из списка плагинов.
+     * @return {void}
+     */
+    function detectHost(){
+        var host = ('' + pref('nfx_host')).trim();
 
-          if (keys.length) {
-            var status = new Lampa.Status(keys.length);
+        if(!host && filled(NFX.tpl_host)) host = NFX.tpl_host;
 
-            status.onComplite = function(result) {
-              var rows = [];
+        if(!host) host = hostFromScript();
 
-              keys.forEach(function(name) {
-                var line = result[name];
+        if(!host) host = hostFromPlugins();
 
-                if (line && line.data && line.type == 'similar') {
-                  var cards = line.data.map(function(item) {
-                    item.title = Lampa.Utils.capitalizeFirstLetter(item.title);
-                    item.release_date = item.year || '0000';
-                    item.balanser = spiderUri;
-                    if (item.img !== undefined) {
-                      if (item.img.charAt(0) === '/')
-                        item.img = Defined.localhost + item.img.substring(1);
-                      if (item.img.indexOf('/proxyimg') !== -1)
-                        item.img = account(item.img);
-                    }
+        NFX.host  = host ? host.replace(/\/+$/, '') : '';
+        NFX.token = filled(NFX.tpl_token) ? NFX.tpl_token : '';
+    }
 
-                    return item;
-                  })
+    /**
+     * Адрес из <script src="...">, которым подключён плагин.
+     * @return {string}
+     */
+    function hostFromScript(){
+        var src = '';
 
-                  rows.push({
-                    title: name,
-                    results: cards
-                  })
+        if(document.currentScript && document.currentScript.src) src = document.currentScript.src;
+
+        if(!src){
+            var list = document.getElementsByTagName('script');
+
+            for(var i = list.length - 1; i >= 0; i--){
+                if(list[i].src && /netflix/i.test(list[i].src)){
+                    src = list[i].src;
+                    break;
                 }
-              })
+            }
+        }
 
-              oncomplite(rows);
+        return src ? origin(src) : '';
+    }
+
+    /**
+     * Адрес из уже установленных плагинов lampac (online.js / sisi.js / tmdbproxy.js).
+     * @return {string}
+     */
+    function hostFromPlugins(){
+        var found = '';
+
+        try {
+            var plugins = Lampa.Plugins.get() || [];
+
+            for(var i = 0; i < plugins.length; i++){
+                var url = plugins[i].url || '';
+
+                if(/(online|sisi|tmdbproxy|lampainit)(\.js|\/js\/)/i.test(url)){
+                    found = origin(url);
+                    break;
+                }
+            }
+        }
+        catch(e){}
+
+        return found;
+    }
+
+    /**
+     * Схема + хост + порт из полного URL.
+     * @param {string} url
+     * @return {string}
+     */
+    function origin(url){
+        var match = ('' + url).match(/^(https?:)?\/\/[^\/]+/i);
+
+        return match ? match[0] : '';
+    }
+
+    /**
+     * Дописать к URL параметры авторизации lampac.
+     * @param {string} url
+     * @return {string}
+     */
+    function account(url){
+        url = url + '';
+
+        if(url.indexOf('account_email=') === -1){
+            var email = Lampa.Storage.get('account_email');
+
+            if(email) url = Lampa.Utils.addUrlComponent(url, 'account_email=' + encodeURIComponent(email));
+        }
+
+        if(url.indexOf('uid=') === -1){
+            var uid = Lampa.Storage.get('lampac_unic_id', '');
+
+            if(uid) url = Lampa.Utils.addUrlComponent(url, 'uid=' + encodeURIComponent(uid));
+        }
+
+        if(url.indexOf('token=') === -1 && NFX.token){
+            url = Lampa.Utils.addUrlComponent(url, 'token=' + encodeURIComponent(NFX.token));
+        }
+
+        return url;
+    }
+
+    /**
+     * Картинка TMDB нужного размера через прокси Lampa/Lampac.
+     * @param {string} path
+     * @param {string} size
+     * @return {string}
+     */
+    function img(path, size){
+        if(!path) return '';
+
+        if(/^https?:/i.test(path)) return path;
+
+        try {
+            return Lampa.TMDB.image('t/p/' + (size || 'w500') + path);
+        }
+        catch(e){
+            return 'https://image.tmdb.org/t/p/' + (size || 'w500') + path;
+        }
+    }
+
+    /**
+     * Подобрать иллюстрацию для карточки с учётом выбранной формы.
+     * @param {object} card
+     * @param {boolean} wide
+     * @return {string}
+     */
+    function cardImage(card, wide){
+        if(!card) return '';
+
+        if(wide){
+            if(card.backdrop_path) return img(card.backdrop_path, 'w780');
+            if(card.poster_path)   return img(card.poster_path, 'w500');
+        }
+        else {
+            if(card.poster_path)   return img(card.poster_path, 'w500');
+            if(card.backdrop_path) return img(card.backdrop_path, 'w780');
+        }
+
+        if(card.profile_path) return img(card.profile_path, 'w300');
+
+        return card.poster || card.img || card.background_image || '';
+    }
+
+    /**
+     * Крупный фон для баннера.
+     * @param {object} card
+     * @return {string}
+     */
+    function heroImage(card){
+        if(!card) return '';
+
+        if(card.backdrop_path) return img(card.backdrop_path, 'w1280');
+        if(card.poster_path)   return img(card.poster_path, 'w780');
+
+        return '';
+    }
+
+    /**
+     * Название карточки.
+     * @param {object} card
+     * @return {string}
+     */
+    function cardTitle(card){
+        return card.title || card.name || card.original_title || card.original_name || '';
+    }
+
+    /**
+     * Год выпуска.
+     * @param {object} card
+     * @return {string}
+     */
+    function cardYear(card){
+        var date = card.release_date || card.first_air_date || card.birthday || '';
+
+        return ('' + date).slice(0, 4);
+    }
+
+    /**
+     * Netflix-style «% совпадения» — считаем из рейтинга TMDB.
+     * @param {object} card
+     * @return {number} 0 если рейтинга нет
+     */
+    function matchPercent(card){
+        var vote = parseFloat(card.vote_average || 0);
+
+        if(!vote) return 0;
+
+        // 5.0 -> 50%, 10.0 -> 99%
+        return Math.max(35, Math.min(99, Math.round(vote * 9.9)));
+    }
+
+    /**
+     * Возрастной рейтинг по данным TMDB (грубая оценка, если нет releases).
+     * @param {object} card
+     * @return {string}
+     */
+    function ageLimit(card){
+        if(card.adult) return '18+';
+
+        var genres = card.genre_ids || [];
+
+        if(indexOf(genres, 27) > -1 || indexOf(genres, 53) > -1) return '18+';
+        if(indexOf(genres, 16) > -1 || indexOf(genres, 10751) > -1) return '0+';
+        if(indexOf(genres, 28) > -1 || indexOf(genres, 80) > -1) return '16+';
+
+        return '12+';
+    }
+
+    /**
+     * Тип карточки.
+     * @param {object} card
+     * @return {boolean} true если сериал
+     */
+    function isSerial(card){
+        return !!(card.name || card.original_name || card.first_air_date || card.number_of_seasons);
+    }
+
+    /**
+     * Названия жанров через запятую.
+     * @param {object} card
+     * @return {string}
+     */
+    function genreNames(card){
+        var ids = card.genre_ids || [];
+
+        if(!ids.length) return '';
+
+        try {
+            var names = Lampa.Api.sources.tmdb.getGenresNameFromIds(isSerial(card) ? 'tv' : 'movie', ids.slice(0, 3));
+
+            return names.join(' • ');
+        }
+        catch(e){
+            return '';
+        }
+    }
+
+    /** indexOf для массива без Array.prototype.indexOf на древних движках */
+    function indexOf(list, value){
+        if(!list) return -1;
+
+        for(var i = 0; i < list.length; i++){
+            if(list[i] === value) return i;
+        }
+
+        return -1;
+    }
+
+    /** Уникализация карточек по id */
+    function uniqueCards(list){
+        var seen = {};
+        var out  = [];
+
+        for(var i = 0; i < list.length; i++){
+            var card = list[i];
+
+            if(!card) continue;
+
+            var key = (card.id || '') + ':' + (isSerial(card) ? 'tv' : 'mv');
+
+            if(seen[key]) continue;
+
+            seen[key] = true;
+            out.push(card);
+        }
+
+        return out;
+    }
+
+    /** Обрезать текст */
+    function cut(text, limit){
+        text = ('' + (text || '')).replace(/\s+/g, ' ');
+
+        return text.length > limit ? text.slice(0, limit - 1) + '…' : text;
+    }
+
+    /** Экранирование для вставки в HTML */
+    function esc(text){
+        return ('' + (text || ''))
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    /**
+     * Открыть полную карточку. Router появился не во всех сборках Lampa.
+     * @param {object} card
+     */
+    function openCard(card){
+        // Уходим с экрана — трейлер в карточке больше не нужен
+        trailerStop();
+
+        if(Lampa.Router && typeof Lampa.Router.call === 'function'){
+            return Lampa.Router.call('full', card);
+        }
+
+        Lampa.Activity.push({
+            url: '',
+            component: 'full',
+            id: card.id,
+            method: isSerial(card) ? 'tv' : 'movie',
+            card: card,
+            source: card.source || 'tmdb'
+        });
+    }
+
+    /**
+     * Порционная загрузка полок. В старых сборках Lampa.Api.partNext отсутствует.
+     * @param {array} parts массив функций function(call)
+     * @param {number} limit
+     * @param {function} loaded
+     * @param {function} empty
+     */
+    function partNext(parts, limit, loaded, empty){
+        if(Lampa.Api && typeof Lampa.Api.partNext === 'function'){
+            return Lampa.Api.partNext(parts, limit, loaded, empty);
+        }
+
+        var pieces = [];
+
+        for(var i = 0; i < parts.length && pieces.length < limit; i++){
+            if(typeof parts[i] === 'function') pieces.push(i);
+        }
+
+        if(!pieces.length) return empty();
+
+        var results = [];
+        var waiting = pieces.length;
+
+        pieces.forEach(function(index){
+            var call = parts[index];
+
+            parts[index] = false;
+
+            var done = function(json){
+                if(json && json.results && json.results.length) results.push(json);
+
+                waiting--;
+
+                if(waiting) return;
+
+                if(results.length) loaded(results);
+                else partNext(parts, limit, loaded, empty);
+            };
+
+            try { call(done); }
+            catch(e){ done(); }
+        });
+    }
+
+    /** Перевод с фолбэком на сам ключ */
+    function tr(key){
+        var value = Lampa.Lang.translate(key);
+
+        return value === key ? key : value;
+    }
+
+    /* ---------- src/theme.js ---------- */
+    /**
+     * Стили. Два независимых блока:
+     *   nfx-core  — стили собственных компонентов плагина (всегда)
+     *   nfx-theme — переоформление всего интерфейса Lampa (по настройке)
+     */
+
+    /** Собственные компоненты плагина */
+    function cssCore(){
+        return [
+    '.nfx{position:relative;color:#fff}',
+    '.nfx *{box-sizing:border-box}',
+
+    /* главная Netflix: убираем отступ под шапку, шапка становится градиентом */
+    'body.nfx--home .wrap__content{padding-top:0}',
+    'body.nfx--home .head{background:linear-gradient(180deg,rgba(0,0,0,.8) 0,rgba(0,0,0,.35) 55%,rgba(0,0,0,0) 100%);border:0}',
+    'body.nfx--home .background__one,body.nfx--home .background__two{opacity:0}',
+    'body.nfx--home .head__title{display:none}',
+    'body.nfx--nav .head{display:none}',
+
+    /* ---------- баннер ---------- */
+    '.nfx-bb{position:relative;height:72vh;min-height:24em;margin:0 0 -4.5em 0;overflow:hidden}',
+    '.nfx-bb--noart{height:auto;min-height:0;margin-bottom:1em}',
+    '.nfx-bb__art,.nfx-bb__art-next{position:absolute;top:0;left:0;width:100%;height:100%;background-repeat:no-repeat;background-position:center 18%;background-size:cover;transition:opacity .8s ease}',
+    '.nfx-bb__art-next{opacity:0}',
+    '.nfx-bb--swap .nfx-bb__art{opacity:0}',
+    '.nfx-bb--swap .nfx-bb__art-next{opacity:1}',
+    '.nfx-bb__scrim{position:absolute;top:0;left:0;right:0;bottom:0;background:linear-gradient(77deg,rgba(0,0,0,.85) 0,rgba(0,0,0,.55) 42%,rgba(0,0,0,0) 78%)}',
+    '.nfx-bb__scrim-b{position:absolute;left:0;right:0;bottom:0;height:52%;background:linear-gradient(180deg,rgba(20,20,20,0) 0,rgba(20,20,20,.65) 52%,#141414 100%)}',
+    '.nfx-bb__info{position:absolute;left:3em;bottom:9em;width:44%;min-width:18em;z-index:2}',
+    '.nfx-bb--noart .nfx-bb__info{position:relative;left:0;bottom:0;width:auto;padding:2em 3em 0}',
+    '.nfx-bb__brand{display:flex;align-items:center;font-size:.85em;letter-spacing:.24em;text-transform:uppercase;color:#e5e5e5;margin-bottom:.7em}',
+    '.nfx-bb__logo{max-width:70%;max-height:6.5em;margin-bottom:.5em;display:block}',
+    '.nfx-bb__title{font-size:3.4em;line-height:1.02;font-weight:900;letter-spacing:-.02em;text-shadow:0 .08em .3em rgba(0,0,0,.55);margin-bottom:.25em;max-height:2.1em;overflow:hidden}',
+    '.nfx-bb__meta{display:flex;align-items:center;flex-wrap:wrap;font-size:1.15em;margin-bottom:.7em;color:#e5e5e5}',
+    '.nfx-bb__meta > *{margin-right:.9em}',
+    '.nfx-bb__match{color:#46d369;font-weight:700}',
+    '.nfx-bb__age{border:1px solid rgba(255,255,255,.45);padding:0 .35em;font-size:.85em;line-height:1.5}',
+    '.nfx-bb__descr{font-size:1.25em;line-height:1.35;color:#fff;text-shadow:0 .1em .3em rgba(0,0,0,.6);max-height:4.1em;overflow:hidden;margin-bottom:1em}',
+    '.nfx-bb__buttons{display:flex;align-items:center}',
+    '.nfx-bb__dots{position:absolute;right:3em;bottom:9.5em;display:flex;z-index:2}',
+    '.nfx-bb__dot{width:.55em;height:.55em;border-radius:50%;background:rgba(255,255,255,.35);margin-left:.5em}',
+    '.nfx-bb__dot--on{background:#e50914}',
+
+    /* ---------- кнопки ---------- */
+    '.nfx-btn{display:flex;align-items:center;height:2.7em;padding:0 1.5em;margin-right:.8em;border-radius:.22em;font-size:1.2em;font-weight:700;background:rgba(109,109,110,.75);color:#fff;white-space:nowrap}',
+    '.nfx-btn svg{width:1.35em;height:1.35em;margin-right:.6em;flex-shrink:0}',
+    '.nfx-btn--play{background:#fff;color:#000}',
+    '.nfx-btn.focus,.nfx-btn.hover{background:#e50914;color:#fff;box-shadow:0 0 0 .16em rgba(255,255,255,.9)}',
+    '.nfx-btn--play.focus,.nfx-btn--play.hover{background:rgba(255,255,255,.75);color:#000}',
+
+    /* ---------- полки ---------- */
+    '.nfx-rows{position:relative;z-index:3}',
+    '.nfx-row{padding-bottom:.4em;padding-top:7em;margin-top:-7em;pointer-events:none}',
+    '.nfx-row__head,.nfx-row__body,.nfx-row__meta{pointer-events:auto}',
+    '.nfx-row__head{display:flex;align-items:center;padding:0 3em;margin-bottom:.35em}',
+    '.nfx-row__title{font-size:1.45em;font-weight:700;color:#e5e5e5;letter-spacing:.01em;opacity:.62;transition:opacity .25s}',
+    '.nfx-row--active .nfx-row__title{opacity:1}',
+    '.nfx-row__more{margin-left:1em;font-size:.95em;color:#e50914;opacity:0;padding:.2em .7em;border-radius:.2em;transition:opacity .25s}',
+    '.nfx-row--active .nfx-row__more{opacity:1}',
+    '.nfx-row__more.focus{background:#e50914;color:#fff;opacity:1}',
+    '.nfx-row__body .scroll__content{padding:.9em 3em}',
+    '.nfx-row__body .scroll__body{display:flex}',
+
+    /* ---------- верхняя панель ---------- */
+    '.nfx-nav{position:absolute;top:0;left:0;right:0;height:5.4em;display:flex;align-items:center;padding:0 3em;z-index:30;background:linear-gradient(180deg,rgba(0,0,0,.9) 0,rgba(0,0,0,.45) 60%,rgba(0,0,0,0) 100%)}',
+    '.nfx-nav__side{flex:0 0 auto;display:flex;align-items:center;min-width:9em}',
+    '.nfx-nav__side--right{justify-content:flex-end}',
+    '.nfx-nav__center{flex:1 1 auto;display:flex;align-items:center;justify-content:center}',
+    '.nfx-nav__profile{display:flex;align-items:center;padding:.3em;border-radius:.3em}',
+    '.nfx-nav__avatar{width:2.1em;height:2.1em;border-radius:.25em;overflow:hidden;flex-shrink:0}',
+    '.nfx-nav__avatar svg,.nfx-nav__avatar img{width:100%;height:100%;display:block;object-fit:cover}',
+    '.nfx-nav__caret{margin-left:.45em;font-size:.8em;color:#fff;opacity:.85}',
+    '.nfx-nav__profile.focus,.nfx-nav__profile.hover{box-shadow:0 0 0 .14em #fff}',
+    '.nfx-nav__item{font-size:1.3em;font-weight:500;color:#e5e5e5;padding:.42em 1.1em;margin:0 .25em;border-radius:2em;white-space:nowrap;line-height:1.2}',
+    '.nfx-nav__item--icon{display:flex;align-items:center;justify-content:center;padding:.42em .7em}',
+    '.nfx-nav__item--icon svg{width:1.35em;height:1.35em;display:block}',
+    '.nfx-nav__item--active{background:#fff;color:#000;font-weight:700}',
+    '.nfx-nav__item.focus,.nfx-nav__item.hover{background:#fff;color:#000;font-weight:700}',
+    '.nfx-nav__item.focus svg,.nfx-nav__item.hover svg{color:#000}',
+
+    /* без баннера полки начинаются под панелью */
+    '.nfx--no-hero .nfx-rows{padding-top:6.4em}',
+
+    /* ---------- карточка ---------- */
+    '.nfx-card{flex-shrink:0;width:13.2em;margin-right:.5em;position:relative}',
+    '.nfx-card__view{position:relative;padding-bottom:56.25%;border-radius:.25em;overflow:hidden;background:#2b2b2b;transition:transform .25s ease,box-shadow .25s ease;transform-origin:center center;will-change:transform}',
+    '.nfx-card__img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .4s}',
+    '.nfx-card__img--loaded{opacity:1}',
+    '.nfx-card__img--fallback{object-position:center 28%}',
+    '.nfx-card__grad{position:absolute;left:0;right:0;bottom:0;height:55%;background:linear-gradient(180deg,rgba(0,0,0,0) 0,rgba(0,0,0,.8) 100%);opacity:0;transition:opacity .25s}',
+    '.nfx-card__label{position:absolute;left:.6em;right:.6em;bottom:.5em;font-size:.95em;font-weight:700;line-height:1.15;max-height:2.4em;overflow:hidden;opacity:0;transition:opacity .25s;text-shadow:0 1px 2px rgba(0,0,0,.8)}',
+    '.nfx-card__badge{position:absolute;top:.4em;left:.4em;background:#e50914;color:#fff;font-size:.7em;font-weight:900;letter-spacing:.08em;padding:.2em .45em;border-radius:.15em}',
+    '.nfx-card__vote{position:absolute;top:.4em;right:.4em;background:rgba(0,0,0,.7);color:#46d369;font-size:.8em;font-weight:700;padding:.15em .4em;border-radius:.15em}',
+    '.nfx-card__progress{position:absolute;left:.5em;right:.5em;bottom:.45em;height:.22em;background:rgba(255,255,255,.3);border-radius:.2em;overflow:hidden}',
+    '.nfx-card__progress > div{height:100%;background:#e50914}',
+    '.nfx-card--more .nfx-card__view{background:rgba(109,109,110,.28)}',
+    '.nfx-card--more.focus .nfx-card__view,.nfx-card--more.hover .nfx-card__view{background:rgba(255,255,255,.16)}',
+    '.nfx-card__more-ico{position:absolute;left:0;top:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;font-size:3.2em;font-weight:300;opacity:.85}',
+    '.nfx-card__title{margin-top:.45em;font-size:.95em;line-height:1.2;max-height:2.4em;overflow:hidden;color:#b3b3b3}',
+    '.nfx-card.focus .nfx-card__view,.nfx-card.hover .nfx-card__view{transform:scale(1.08);box-shadow:0 0 0 .14em #fff,0 1.1em 2em rgba(0,0,0,.75);z-index:5}',
+    '.nfx-card.focus .nfx-card__grad,.nfx-card.focus .nfx-card__label,.nfx-card.hover .nfx-card__grad,.nfx-card.hover .nfx-card__label{opacity:1}',
+    '.nfx-card.focus .nfx-card__title{color:#fff}',
+
+    /* ---------- expand: фокусная карточка раскрывается в 16:9 ---------- */
+    /* ширину НЕ анимируем: transition ломает расчёт позиции скролла, */
+    /* плавность даёт кроссфейд кадров и оверлея */
+    '.nfx-row--expand .nfx-card{width:11.6em;height:17.5em;margin-right:.5em}',
+    '.nfx-row--expand .nfx-card__view{position:absolute;top:0;left:0;right:0;bottom:0;padding-bottom:0;transition:box-shadow .2s ease}',
+    '.nfx-row--expand .nfx-card.focus{width:31em}',
+
+    /* мышь: раскрываем поверх соседей — полка не перекладывается,
+       поэтому здесь ширину можно анимировать без вреда для скролла */
+    '.nfx-row--expand .nfx-card--over.focus,.nfx-row--expand .nfx-card--over.hover{width:11.6em;z-index:20}',
+    '.nfx-row--expand .nfx-card--over.focus .nfx-card__view,.nfx-row--expand .nfx-card--over.hover .nfx-card__view{width:31em;right:auto;transition:width .22s ease,box-shadow .2s ease}',
+    '.nfx-row--expand .nfx-card.focus .nfx-card__view,.nfx-row--expand .nfx-card.hover .nfx-card__view{transform:none;box-shadow:0 0 0 .16em #fff,0 1.2em 2.2em rgba(0,0,0,.8)}',
+    '.nfx-card__img-wide{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .3s}',
+    '.nfx-row--expand .nfx-card.focus .nfx-card__img-wide.nfx-card__img--loaded{opacity:1}',
+    /* трейлер: iframe масштабируем и кропаем, как object-fit:cover,
+       иначе YouTube добавляет чёрные поля под свои пропорции */
+    '.nfx-card__trailer{position:absolute;top:0;left:0;right:0;bottom:0;overflow:hidden;z-index:2;opacity:0;transition:opacity .5s ease;pointer-events:none;background:#000}',
+    '.nfx-card__trailer--on{opacity:1}',
+    '.nfx-card__trailer > div,.nfx-card__trailer iframe{position:absolute;top:50%;left:50%;width:100%;height:100%;border:0;-webkit-transform:translate(-50%,-50%) scale(1.24);transform:translate(-50%,-50%) scale(1.24)}',
+    '.nfx-card__shade{position:absolute;left:0;right:0;bottom:0;height:70%;background:linear-gradient(180deg,rgba(0,0,0,0) 0,rgba(0,0,0,.15) 40%,rgba(0,0,0,.85) 100%);opacity:0;transition:opacity .3s}',
+    '.nfx-row--expand .nfx-card.focus .nfx-card__shade{opacity:1}',
+    '.nfx-card__shade{z-index:3}',
+    '.nfx-card__promo{position:absolute;left:1.1em;right:1.1em;bottom:1.1em;opacity:0;transition:opacity .3s;z-index:4}',
+    '.nfx-row--expand .nfx-card.focus .nfx-card__promo{opacity:1}',
+    '.nfx-card__kind{display:flex;align-items:center;font-size:.75em;letter-spacing:.22em;text-transform:uppercase;color:#e5e5e5;margin-bottom:.4em}',
+    '.nfx-card__titlebox{position:relative;height:3.6em}',
+    '.nfx-card__logo{position:absolute;left:0;bottom:0;height:3.6em;width:auto;max-width:70%;object-fit:contain;object-position:left bottom;opacity:0;transition:opacity .25s}',
+    '.nfx-card__logo--on{opacity:1}',
+    '.nfx-card__name{position:absolute;left:0;right:0;bottom:0;font-size:1.9em;font-weight:900;line-height:.98;letter-spacing:-.015em;text-transform:uppercase;max-height:2.94em;overflow:hidden;text-shadow:0 .06em .3em rgba(0,0,0,.85);transition:opacity .25s}',
+    '.nfx-card__name--off{opacity:0}',
+    '.nfx-card__name--long{font-size:1.5em;letter-spacing:-.01em}',
+    '.nfx-card__name--xlong{font-size:1.2em;letter-spacing:0;line-height:1.05;max-height:3.15em}',
+    '.nfx-row--expand .nfx-card__progress{left:0;right:0;bottom:0;height:.28em;border-radius:0;background:rgba(255,255,255,.28);z-index:5}',
+    '.nfx-row--expand .nfx-card--more{width:11.6em;height:17.5em}',
+
+    /* нет кадра 16:9: постер слева на градиенте, название справа */
+    '.nfx-row--expand .nfx-card--noart.focus .nfx-card__view,.nfx-row--expand .nfx-card--noart.hover .nfx-card__view,.nfx-row--expand .nfx-card--pending.focus .nfx-card__view,.nfx-row--expand .nfx-card--pending.hover .nfx-card__view{background:linear-gradient(100deg,#232323 0,#0d0d0d 100%)}',
+    '.nfx-row--expand .nfx-card--noart.focus .nfx-card__img,.nfx-row--expand .nfx-card--noart.hover .nfx-card__img,.nfx-row--expand .nfx-card--pending.focus .nfx-card__img,.nfx-row--expand .nfx-card--pending.hover .nfx-card__img{width:37.6%;right:auto}',
+    '.nfx-row--expand .nfx-card--noart.focus .nfx-card__shade,.nfx-row--expand .nfx-card--noart.hover .nfx-card__shade,.nfx-row--expand .nfx-card--pending.focus .nfx-card__shade,.nfx-row--expand .nfx-card--pending.hover .nfx-card__shade{display:none}',
+    '.nfx-row--expand .nfx-card--noart.focus .nfx-card__promo,.nfx-row--expand .nfx-card--noart.hover .nfx-card__promo,.nfx-row--expand .nfx-card--pending.focus .nfx-card__promo,.nfx-row--expand .nfx-card--pending.hover .nfx-card__promo{left:42%;right:1.4em;bottom:auto;top:50%;-webkit-transform:translateY(-50%);transform:translateY(-50%)}',
+
+    /* постер и кадр меняются кроссфейдом: переход, а не загрузка */
+    '.nfx-card__img{transition:opacity .35s ease,width .35s ease}',
+    '.nfx-row--expand .nfx-card.focus .nfx-card__img-wide.nfx-card__img--loaded ~ .nfx-card__shade{opacity:1}',
+    '.nfx-row--expand .nfx-card.focus:not(.nfx-card--noart):not(.nfx-card--pending) .nfx-card__img,.nfx-row--expand .nfx-card.hover:not(.nfx-card--noart):not(.nfx-card--pending) .nfx-card__img{opacity:0}',
+
+    /* строка метаданных под полкой */
+    '.nfx-row__meta{padding:.7em 3em 0;min-height:4.9em}',
+    '.nfx-row__meta-1{font-size:1.05em;font-weight:700;color:#fff;line-height:1.25;max-height:1.3em;overflow:hidden}',
+    '.nfx-row__meta-2{font-size:1.05em;color:#b3b3b3;margin-top:.35em;line-height:1.35;max-height:2.7em;overflow:hidden}',
+
+    /* постеры 2:3 */
+    '.nfx-row--poster .nfx-card{width:10.6em}',
+    '.nfx-row--poster .nfx-card__view{padding-bottom:150%}',
+
+    /* Топ-10: номер абсолютным слоем — em внутри flex-basis считается от своего font-size, поэтому только padding/width родителя */
+    '.nfx-row--top .nfx-card{width:17em;position:relative;padding-left:8.6em}',
+    '.nfx-row--top .nfx-card__rank{position:absolute;left:0;top:0;bottom:0;width:9.2em;display:flex;align-items:flex-end;justify-content:flex-end;overflow:hidden;z-index:1}',
+    '.nfx-row--top .nfx-card__rank > span{font-family:Arial,Helvetica,sans-serif;font-weight:900;font-size:11.6em;line-height:.8;letter-spacing:-.06em;color:#141414;-webkit-text-stroke:.028em #6d6d6e;white-space:nowrap;transition:-webkit-text-stroke-color .25s}',
+    '.nfx-row--top .nfx-card__box{position:relative;z-index:2}',
+    '.nfx-row--top .nfx-card__view{padding-bottom:150%}',
+    '.nfx-row--top .nfx-card__title{display:none}',
+    '.nfx-row--top .nfx-card.focus .nfx-card__rank > span,.nfx-row--top .nfx-card.hover .nfx-card__rank > span{-webkit-text-stroke-color:#fff}',
+
+    /* ---------- служебное ---------- */
+    '.nfx-empty{padding:7em 3em 4em;text-align:center;max-width:34em;margin:0 auto}',
+    '.nfx-empty__title{font-size:2em;font-weight:800;color:#fff;margin-bottom:.5em}',
+    '.nfx-empty__hint{font-size:1.2em;line-height:1.4;color:#8c8c8c}',
+    '.nfx-load{padding:3em;text-align:center;color:#6d6d6e}',
+    '.nfx-spinner{display:inline-block;width:1.6em;height:1.6em;border:.18em solid rgba(229,9,20,.25);border-top-color:#e50914;border-radius:50%;animation:nfx-spin .8s linear infinite}',
+    '@keyframes nfx-spin{to{transform:rotate(360deg)}}',
+
+    /* невысокие экраны: 720p ТВ и окно браузера — иначе блок уезжает под шапку */
+    '@media screen and (max-height:820px){',
+      '.nfx-row{padding-top:5.4em;margin-top:-5.4em}',
+      '.nfx-row--expand .nfx-card{width:10.4em;height:15.6em}',
+      '.nfx-row--expand .nfx-card.focus{width:27.7em}',
+      '.nfx-row--expand .nfx-card--over.focus,.nfx-row--expand .nfx-card--over.hover{width:10.4em}',
+      '.nfx-row--expand .nfx-card--over.focus .nfx-card__view,.nfx-row--expand .nfx-card--over.hover .nfx-card__view{width:27.7em}',
+      '.nfx-row--expand .nfx-card--more{width:10.4em;height:15.6em}',
+      '.nfx-bb{height:78vh}',
+      '.nfx-bb__info{bottom:6em}',
+      '.nfx-bb__dots{bottom:6.5em}',
+      '.nfx-bb__logo{max-height:4.6em}',
+      '.nfx-bb__title{font-size:2.7em}',
+      '.nfx-bb__descr{font-size:1.15em;max-height:4.05em}',
+    '}',
+
+    /* мелкие экраны */
+    '@media screen and (max-width:767px){',
+      '.nfx-bb{height:56vh}',
+      '.nfx-bb__info{left:1.5em;bottom:5em;width:80%}',
+      '.nfx-bb__title{font-size:2.2em}',
+      '.nfx-bb__descr{font-size:1.05em;max-height:5.4em}',
+      '.nfx-row__head,.nfx-row__body .scroll__content{padding-left:1.5em;padding-right:1.5em}',
+      '.nfx-card{width:11em}',
+      '.nfx-nav{height:4.4em;padding:0 1.5em}',
+      '.nfx-nav__side{min-width:0}',
+      '.nfx-nav__item{font-size:1.1em;padding:.38em .75em;margin:0 .1em}',
+      '.nfx--no-hero .nfx-rows{padding-top:5.2em}',
+      '.nfx-row{padding-top:4.6em;margin-top:-4.6em}',
+      '.nfx-row__meta{padding-left:1.5em;padding-right:1.5em}',
+      '.nfx-row--expand .nfx-card{width:8.6em;height:12.9em}',
+      '.nfx-row--expand .nfx-card.focus{width:22.9em}',
+      '.nfx-row--expand .nfx-card--over.focus,.nfx-row--expand .nfx-card--over.hover{width:8.6em}',
+      '.nfx-row--expand .nfx-card--over.focus .nfx-card__view,.nfx-row--expand .nfx-card--over.hover .nfx-card__view{width:22.9em}',
+      '.nfx-card__titlebox{height:2.8em}',
+      '.nfx-card__logo{height:2.8em}',
+      '.nfx-row--expand .nfx-card--more{width:8.6em;height:12.9em}',
+      '.nfx-row--top .nfx-card{width:14em;padding-left:7em}',
+      '.nfx-row--top .nfx-card__rank{width:7.4em}',
+      '.nfx-row--top .nfx-card__rank > span{font-size:9.2em}',
+    '}'
+        ].join('');
+    }
+
+    /** Глобальная тема Netflix для стандартных экранов Lampa */
+    function cssTheme(){
+        return [
+    /* фон и типографика */
+    'body.nfx--theme{background:#141414}',
+    'body.nfx--theme .background__one,body.nfx--theme .background__two{filter:brightness(.55) saturate(1.05)}',
+    'body.nfx--theme .activity__loader{border-top-color:#e50914 !important}',
+
+    /* верхняя панель */
+    'body.nfx--theme .head{background:linear-gradient(180deg,rgba(0,0,0,.85) 0,rgba(0,0,0,.45) 55%,rgba(0,0,0,0) 100%)}',
+    'body.nfx--theme .head__action.focus,body.nfx--theme .head__action.hover{background:#e50914;color:#fff}',
+    'body.nfx--theme .head__logo-icon path,body.nfx--theme .head__logo-icon [fill]{fill:#e50914}',
+
+    /* левое меню */
+    'body.nfx--theme .menu__item{border-radius:.25em;padding-top:.75em;padding-bottom:.75em}',
+    'body.nfx--theme .menu__item.focus,body.nfx--theme .menu__item.traverse,body.nfx--theme .menu__item.hover{background:#e50914;color:#fff}',
+    'body.nfx--theme .menu__item.focus .menu__ico > img,body.nfx--theme .menu__item.hover .menu__ico > img{filter:none}',
+    'body.nfx--theme .menu__item.focus .menu__ico [stroke],body.nfx--theme .menu__item.hover .menu__ico [stroke]{stroke:#fff}',
+    'body.nfx--theme .menu__item.focus .menu__ico path[fill],body.nfx--theme .menu__item.focus .menu__ico rect[fill],body.nfx--theme .menu__item.focus .menu__ico circle[fill]{fill:#fff}',
+    'body.nfx--theme .menu__item.active::after,body.nfx--theme .menu__item.focus::after{content:"";position:absolute;left:0;top:.5em;bottom:.5em;width:.2em;background:#fff;border-radius:.2em}',
+    'body.nfx--theme .menu__split{border-top-color:rgba(255,255,255,.12)}',
+
+    /* стандартные карточки Lampa */
+    'body.nfx--theme .card__view{border-radius:.25em;transition:transform .25s ease}',
+    'body.nfx--theme .card__img{border-radius:.25em;background-color:#2b2b2b}',
+    'body.nfx--theme .card.focus .card__view,body.nfx--theme .card.hover .card__view{transform:scale(1.06);box-shadow:0 0 0 .13em #fff,0 .9em 1.8em rgba(0,0,0,.7)}',
+    'body.nfx--theme .card__title{color:#b3b3b3;font-size:1.15em}',
+    'body.nfx--theme .card.focus .card__title{color:#fff}',
+    'body.nfx--theme .card__age{color:#6d6d6e}',
+    'body.nfx--theme .card__vote{background:rgba(0,0,0,.72);color:#46d369;border-radius:.2em}',
+    'body.nfx--theme .card__type,body.nfx--theme .card__quality > div{border-radius:.2em;background:#e50914;color:#fff}',
+    'body.nfx--theme .card__marker{border-radius:.2em}',
+    'body.nfx--theme .card__promo-title{font-weight:900}',
+
+    /* полки */
+    'body.nfx--theme .items-line{padding-bottom:2.2em}',
+    'body.nfx--theme .items-line__title{font-size:1.45em;font-weight:700;color:#e5e5e5}',
+    'body.nfx--theme .items-line__more{border-radius:.2em;background:rgba(109,109,110,.6)}',
+    'body.nfx--theme .items-line__more.focus{background:#e50914;color:#fff}',
+
+    /* кнопки / селекторы */
+    'body.nfx--theme .simple-button{border-radius:.22em;background:rgba(109,109,110,.75);font-weight:700}',
+    'body.nfx--theme .simple-button.focus,body.nfx--theme .simple-button.hover{background:#e50914;color:#fff}',
+    'body.nfx--theme .full-start__button{border-radius:.22em;font-weight:700}',
+    'body.nfx--theme .full-start__button.focus,body.nfx--theme .full-start__button.hover{background:#e50914;color:#fff}',
+    'body.nfx--theme .full-start__button.focus [fill],body.nfx--theme .full-start__button.hover [fill]{fill:#fff}',
+    'body.nfx--theme .full-start__button.focus [stroke],body.nfx--theme .full-start__button.hover [stroke]{stroke:#fff}',
+
+    /* страница фильма */
+    'body.nfx--theme .full-start-new__title,body.nfx--theme .full-start__title{font-weight:900;letter-spacing:-.01em}',
+    'body.nfx--theme .full-start-new__img,body.nfx--theme .full-start__poster{border-radius:.25em}',
+    'body.nfx--theme .full-start-new__rate-line > div,body.nfx--theme .full-descr__tag{border-radius:.2em}',
+    'body.nfx--theme .full-start-new__reactions > div.focus{background:#e50914}',
+    'body.nfx--theme .full-descr__left{border-color:rgba(255,255,255,.12)}',
+
+    /* настройки, модалки, селектбоксы */
+    'body.nfx--theme .settings__content,body.nfx--theme .modal__content,body.nfx--theme .selectbox__content{background:#181818;border-radius:.3em}',
+    'body.nfx--theme .settings-folder.focus,body.nfx--theme .settings-param.focus,body.nfx--theme .selectbox-item.focus,body.nfx--theme .settings-param.hover,body.nfx--theme .selectbox-item.hover{background:#e50914;color:#fff}',
+    'body.nfx--theme .settings-param__value{color:#e50914}',
+    'body.nfx--theme .settings-param.focus .settings-param__value{color:#fff}',
+    'body.nfx--theme .settings-param__descr,body.nfx--theme .settings-folder__descr{color:#8c8c8c}',
+    'body.nfx--theme .settings-param.focus .settings-param__descr,body.nfx--theme .settings-folder.focus .settings-folder__descr{color:rgba(255,255,255,.85)}',
+    'body.nfx--theme .settings__head,body.nfx--theme .modal__head{border-bottom:1px solid rgba(255,255,255,.1)}',
+    'body.nfx--theme .settings-param > div.settings-param__status{border-radius:.2em}',
+
+    /* поиск и клавиатура */
+    'body.nfx--theme .search-box__input,body.nfx--theme .simple-keyboard{background:#181818;border-radius:.3em}',
+    'body.nfx--theme .simple-keyboard .hg-button.focus,body.nfx--theme .simple-keyboard .hg-button.hover{background:#e50914 !important;color:#fff !important}',
+
+    /* торренты / онлайн-балансеры */
+    'body.nfx--theme .torrent-item.focus,body.nfx--theme .online-prestige.focus,body.nfx--theme .online.focus,body.nfx--theme .videos__item.focus{background:#e50914 !important;color:#fff}',
+    'body.nfx--theme .torrent-item__title{font-weight:700}',
+    'body.nfx--theme .filter__item.focus,body.nfx--theme .explorer-card.focus{background:#e50914}',
+
+    /* плеер */
+    'body.nfx--theme .player-panel__line > div,body.nfx--theme .timeline-slider__filled{background:#e50914}',
+    'body.nfx--theme .player-panel__playlist .focus,body.nfx--theme .player-panel__position{background:#e50914}',
+    'body.nfx--theme .player-info__name{font-weight:700}',
+
+    /* прочее */
+    'body.nfx--theme .noty__body{background:#e50914;border-radius:.25em;font-weight:700}',
+    'body.nfx--theme .navigation-bar__item.active,body.nfx--theme .navigation-bar__item.focus{color:#e50914}',
+    'body.nfx--theme .empty__title,body.nfx--theme .empty__descr{color:#b3b3b3}',
+    'body.nfx--theme ::-webkit-scrollbar{width:.35em;height:.35em}',
+    'body.nfx--theme ::-webkit-scrollbar-thumb{background:#4d4d4d;border-radius:.2em}',
+    'body.nfx--theme ::-webkit-scrollbar-track{background:transparent}'
+        ].join('');
+    }
+
+    /**
+     * Вставить <style> один раз, вернуть узел.
+     * @param {string} id
+     * @param {string} css
+     * @return {HTMLElement}
+     */
+    function styleInject(id, css){
+        var node = document.getElementById(id);
+
+        if(!node){
+            node = document.createElement('style');
+            node.id = id;
+            node.type = 'text/css';
+            document.head.appendChild(node);
+        }
+
+        if(node.styleSheet) node.styleSheet.cssText = css;
+        else node.textContent = css;
+
+        return node;
+    }
+
+    /** Включить/выключить глобальную тему */
+    function themeToggle(status){
+        $('body').toggleClass('nfx--theme', !!status);
+    }
+
+    /** Инициализация стилей */
+    function themeInit(){
+        styleInject('nfx-core-css', cssCore());
+        styleInject('nfx-theme-css', cssTheme());
+
+        themeToggle(pref('nfx_theme'));
+    }
+
+    /* ---------- src/font.js ---------- */
+    /**
+     * Типографика. Шрифты подключаются с Google Fonts по требованию,
+     * применяются отдельным <style> без CSS-переменных — Tizen 3 и webOS 3
+     * (Chromium 38/47) их не поддерживают.
+     */
+
+    /** Базовый фолбэк — родной шрифт Lampa */
+    var NFX_FONT_FALLBACK = '"SegoeUI","Helvetica Neue",Helvetica,Arial,sans-serif';
+
+    /**
+     * Пресеты. ui — интерфейс и текст, display — крупные заголовки,
+     * numeric — цифры «Топ-10» (нужны плотные, иначе «10» не влезает).
+     */
+    var NFX_FONTS = {
+        'golos-montserrat': {
+            css: 'family=Golos+Text:wght@400..900&family=Montserrat:wght@600..900',
+            ui: '"Golos Text"',
+            display: '"Montserrat"',
+            numeric: '"Montserrat"',
+            caps: true
+        },
+        'golos': {
+            css: 'family=Golos+Text:wght@400..900',
+            ui: '"Golos Text"',
+            display: '"Golos Text"',
+            numeric: '"Golos Text"',
+            caps: false
+        },
+        'manrope': {
+            css: 'family=Manrope:wght@400..800',
+            ui: '"Manrope"',
+            display: '"Manrope"',
+            numeric: '"Manrope"',
+            caps: false
+        },
+        'montserrat': {
+            css: 'family=Montserrat:wght@400..900',
+            ui: '"Montserrat"',
+            display: '"Montserrat"',
+            numeric: '"Montserrat"',
+            caps: true
+        },
+        'inter': {
+            css: 'family=Inter:wght@400..900',
+            ui: '"Inter"',
+            display: '"Inter"',
+            numeric: '"Inter"',
+            caps: false
+        },
+        'inter-montserrat': {
+            css: 'family=Inter:wght@400..900&family=Montserrat:wght@600..900',
+            ui: '"Inter"',
+            display: '"Montserrat"',
+            numeric: '"Montserrat"',
+            caps: true
+        }
+    };
+
+    /**
+     * Собрать описание активного шрифта.
+     * @return {object|null} null — не трогать шрифт Lampa
+     */
+    function fontActive(){
+        var key = '' + pref('nfx_font');
+
+        if(key === 'off') return null;
+
+        if(key === 'custom'){
+            var family = ('' + pref('nfx_font_family')).trim();
+
+            if(!family) return null;
+
+            var quoted = /[",]/.test(family) ? family : '"' + family + '"';
+
+            return {
+                url: ('' + pref('nfx_font_css')).trim(),
+                ui: quoted,
+                display: quoted,
+                numeric: quoted,
+                caps: false
+            };
+        }
+
+        var preset = NFX_FONTS[key] || NFX_FONTS['golos-montserrat'];
+
+        return {
+            url: 'https://fonts.googleapis.com/css2?' + preset.css + '&display=swap',
+            ui: preset.ui,
+            display: preset.display,
+            numeric: preset.numeric,
+            caps: preset.caps
+        };
+    }
+
+    /**
+     * Подключить внешний CSS со шрифтом (один <link>, переиспользуется).
+     * @param {string} url пустая строка — удалить
+     */
+    function fontLink(url){
+        var link = document.getElementById('nfx-font-link');
+
+        if(!url){
+            if(link) link.parentNode.removeChild(link);
+
+            return;
+        }
+
+        if(!link){
+            link = document.createElement('link');
+            link.id = 'nfx-font-link';
+            link.rel = 'stylesheet';
+            link.type = 'text/css';
+
+            // Шрифт не должен блокировать отрисовку на медленных ТВ
+            link.onerror = function(){
+                console.log('NetflixUI', 'font load failed:', url);
+            };
+
+            document.head.appendChild(link);
+        }
+
+        if(link.getAttribute('href') !== url) link.setAttribute('href', url);
+    }
+
+    /**
+     * Правила применения шрифта.
+     * @param {object} font
+     * @return {string}
+     */
+    function cssFont(font){
+        var ui   = font.ui + ',' + NFX_FONT_FALLBACK;
+        var disp = font.display + ',' + font.ui + ',' + NFX_FONT_FALLBACK;
+        var num  = font.numeric + ',Arial,Helvetica,sans-serif';
+
+        var rules = [
+            /* интерфейс */
+            'body.nfx--font,body.nfx--font input,body.nfx--font textarea,body.nfx--font button,body.nfx--font .simple-keyboard-input{font-family:' + ui + '}',
+
+            /* крупные заголовки плагина и Lampa */
+            'body.nfx--font .nfx-bb__title,',
+            'body.nfx--font .nfx-bb__brand,',
+            'body.nfx--font .nfx-row__title,',
+            'body.nfx--font .nfx-btn,',
+            'body.nfx--font .items-line__title,',
+            'body.nfx--font .full-start-new__title,',
+            'body.nfx--font .full-start__title,',
+            'body.nfx--font .settings__head,',
+            'body.nfx--font .search-box__title,',
+            'body.nfx--font .empty__title{font-family:' + disp + '}',
+
+            /* цифры «Топ-10» */
+            'body.nfx--font .nfx-card__rank > span{font-family:' + num + '}',
+
+            /* тонкая настройка начертаний: у Golos/Montserrat есть настоящие 800-900 */
+            'body.nfx--font .nfx-row__title{font-weight:800;letter-spacing:-.005em}',
+            'body.nfx--font .nfx-bb__descr{font-weight:400}',
+            'body.nfx--font .nfx-card__label{font-weight:600}',
+            'body.nfx--font .nfx-btn{font-weight:700}'
+        ];
+
+        // Montserrat раскрывается в капсе с разрядкой — как на киноплакате
+        if(font.caps){
+            rules.push('body.nfx--font .nfx-bb__title{text-transform:uppercase;letter-spacing:.015em;font-weight:800}');
+            rules.push('body.nfx--font .nfx-row__title{letter-spacing:.005em}');
+        }
+        else {
+            rules.push('body.nfx--font .nfx-bb__title{font-weight:800}');
+        }
+
+        return rules.join('');
+    }
+
+    /** Применить текущую настройку шрифта */
+    function fontApply(){
+        var font = fontActive();
+
+        if(!font){
+            fontLink('');
+            styleInject('nfx-font-css', '');
+            $('body').toggleClass('nfx--font', false);
+
+            return;
+        }
+
+        fontLink(font.url);
+        styleInject('nfx-font-css', cssFont(font));
+        $('body').toggleClass('nfx--font', true);
+    }
+
+    /* ---------- src/api.js ---------- */
+    /**
+     * Слой данных: собирает полки для главной страницы.
+     * Полка = { title, results, nfx_shape, url, source, nfx_rank }
+     */
+
+    var nfx_network = null;
+
+    /** Общий Reguest плагина */
+    function net(){
+        if(!nfx_network) nfx_network = new Lampa.Reguest();
+
+        return nfx_network;
+    }
+
+    /**
+     * Запрос к TMDB через штатный источник Lampa (учитывает прокси Lampac).
+     * @param {string} method
+     * @param {function} ok
+     * @param {function} err
+     * @param {number} life минуты кеша
+     */
+    function tmdbGet(method, ok, err, life){
+        Lampa.Api.sources.tmdb.get(method, {}, ok, err, { life: life || NFX.cache.short });
+    }
+
+    /**
+     * Обёртка «полка из TMDB».
+     * @param {object} opts {title, method, shape, life, rank, limit, filter}
+     * @return {function} часть для Lampa.Api.partNext
+     */
+    function partTmdb(opts){
+        return function(call){
+            tmdbGet(opts.method, function(json){
+                var results = json.results || [];
+
+                if(opts.filter) results = filterCards(results, opts.filter);
+
+                results = uniqueCards(results);
+
+                if(opts.limit) results = results.slice(0, opts.limit);
+
+                call({
+                    title: opts.title,
+                    results: results,
+                    url: opts.method,
+                    source: 'tmdb',
+                    nfx_shape: opts.shape || pref('nfx_shape'),
+                    nfx_rank: !!opts.rank
+                });
+            }, call, opts.life);
+        };
+    }
+
+    /**
+     * Полка из локальных данных (закладки, история).
+     * @param {object} opts {title, build:function():array, shape, url, activity}
+     * @return {function}
+     */
+    function partLocal(opts){
+        return function(call){
+            var results = [];
+
+            try { results = opts.build() || []; }
+            catch(e){ results = []; }
+
+            if(!results.length) return call();
+
+            call({
+                title: opts.title,
+                results: results,
+                nfx_shape: opts.shape || pref('nfx_shape'),
+                nfx_meta: !!opts.meta,
+                nfx_activity: opts.activity
+            });
+        };
+    }
+
+    /**
+     * Полка из каталога Lampac (модуль Catalog: rezka, filmix, kinopub…).
+     * @param {string} name имя каталога
+     * @param {string} title
+     * @param {string} url  относительный путь на сервере Lampac
+     * @return {function}
+     */
+    function partLampac(name, title, url){
+        return function(call){
+            if(!NFX.host) return call();
+
+            var full = NFX.host + account(url);
+
+            net().silent(full, function(json){
+                var results = (json && json.results) || [];
+
+                if(!results.length) return call();
+
+                for(var i = 0; i < results.length; i++){
+                    if(!results[i].source) results[i].source = name;
+                }
+
+                call({
+                    title: title,
+                    results: results,
+                    url: url,
+                    source: name,
+                    nfx_shape: pref('nfx_shape')
+                });
+            }, call);
+        };
+    }
+
+    /**
+     * Отсеять карточки без картинок / с мусором.
+     * @param {array} list
+     * @param {string} mode 'art' — требуется backdrop, 'poster' — постер
+     * @return {array}
+     */
+    function filterCards(list, mode){
+        var out = [];
+
+        for(var i = 0; i < list.length; i++){
+            var card = list[i];
+
+            if(!card) continue;
+            if(mode === 'art' && !card.backdrop_path) continue;
+            if(mode === 'poster' && !card.poster_path) continue;
+            if(!card.backdrop_path && !card.poster_path) continue;
+
+            out.push(card);
+        }
+
+        return out;
+    }
+
+    /** Карточки «Продолжить просмотр» с прогрессом */
+    function continueCards(){
+        var movies = Lampa.Favorite.continues('movie') || [];
+        var series = Lampa.Favorite.continues('tv') || [];
+        var anime  = Lampa.Favorite.continues('anime') || [];
+
+        var all = uniqueCards([].concat(series, movies, anime));
+
+        for(var i = 0; i < all.length; i++){
+            all[i].nfx_progress = watchedPercent(all[i]);
+        }
+
+        return all.slice(0, 20);
+    }
+
+    /**
+     * Процент просмотра карточки из таймлайна Lampa.
+     * @param {object} card
+     * @return {number} 0..100
+     */
+    function watchedPercent(card){
+        try {
+            var view = Lampa.Timeline.watched(card, true);
+
+            if(!view) return 0;
+
+            // Для сериалов возвращается массив эпизодов
+            if(view.length){
+                var last = view[view.length - 1];
+
+                return last && last.view ? Math.round(last.view.percent || 0) : 0;
             }
 
-            keys.forEach(function(name) {
-              network.silent(account(links[name]), function(data) {
-                status.append(name, data);
-              }, function() {
-                status.error();
-              }, false, {
-			headers: Object.assign({'X-Kit-AesGcm': Lampa.Storage.get('aesgcmkey', '')}, lampacAuthHeaders())
-		  })
-            })
-          } else {
+            return Math.round(view.percent || 0);
+        }
+        catch(e){
+            return 0;
+        }
+    }
+
+    /** Карточки «Мой список»: закладки + лайки */
+    function myListCards(){
+        return uniqueCards([].concat(favoriteCards('book'), favoriteCards('like'))).slice(0, 20);
+    }
+
+    /**
+     * «Похоже на <последний просмотренный>» — рекомендации TMDB.
+     * @return {function|null}
+     */
+    function partBecause(){
+        var history = [];
+
+        try { history = Lampa.Favorite.get({ type: 'history' }) || []; }
+        catch(e){}
+
+        var seed = null;
+
+        for(var i = 0; i < history.length; i++){
+            if(history[i] && history[i].id && (history[i].poster_path || history[i].backdrop_path)){
+                seed = history[i];
+                break;
+            }
+        }
+
+        if(!seed) return null;
+
+        var type = isSerial(seed) ? 'tv' : 'movie';
+
+        return partTmdb({
+            title: tr('nfx_row_because') + ' «' + cardTitle(seed) + '»',
+            method: type + '/' + seed.id + '/recommendations',
+            life: NFX.cache.short
+        });
+    }
+
+    /**
+     * Полка «Продолжить просмотр» — всегда в режиме раскрытия.
+     * @return {function}
+     */
+    function partContinue(){
+        return partLocal({
+            title: tr('nfx_row_continue'),
+            build: continueCards,
+            shape: 'expand',
+            meta: true,
+            activity: { component: 'favorite', type: 'history', title: tr('nfx_row_continue') }
+        });
+    }
+
+    /**
+     * Собрать список полок для вкладки.
+     * @param {string} tab home | shows | movies | my
+     * @return {array} массив функций-частей
+     */
+    function buildParts(tab){
+        tab = tab || 'home';
+
+        if(tab === 'my')     return partsMy();
+        if(tab === 'shows')  return partsShows();
+        if(tab === 'movies') return partsMovies();
+
+        return partsHome();
+    }
+
+    /** Вкладка «Главная» */
+    function partsHome(){
+        var parts = [];
+
+        parts.push(partContinue());
+
+        parts.push(partLocal({
+            title: tr('nfx_row_mylist'),
+            build: myListCards,
+            activity: { component: 'favorite', type: 'book', title: tr('nfx_row_mylist') }
+        }));
+
+        parts.push(partTmdb({
+            title: tr('nfx_row_trending'),
+            method: 'trending/all/day',
+            filter: 'art',
+            life: 60 * 3
+        }));
+
+        pushTop10(parts, 'movie', tr('nfx_row_top10_movie'));
+        pushTop10(parts, 'tv', tr('nfx_row_top10_tv'));
+
+        var because = partBecause();
+
+        if(because) parts.push(because);
+
+        parts.push(partTmdb({ title: tr('nfx_row_new'),        method: 'movie/now_playing', life: NFX.cache.short }));
+        parts.push(partTmdb({ title: tr('nfx_row_tv_popular'), method: 'tv/popular',        life: NFX.cache.short }));
+        parts.push(partTmdb({ title: tr('nfx_row_acclaimed'),  method: 'movie/top_rated',   life: NFX.cache.long }));
+        parts.push(partTmdb({ title: tr('nfx_row_soon'),       method: 'movie/upcoming',    life: NFX.cache.short }));
+
+        pushLampac(parts);
+        pushGenres(parts, 'movie');
+
+        return parts;
+    }
+
+    /** Вкладка «Сериалы» */
+    function partsShows(){
+        var parts = [];
+
+        parts.push(partContinue());
+
+        parts.push(partTmdb({ title: tr('nfx_row_trending_tv'), method: 'trending/tv/day', filter: 'art', life: 60 * 3 }));
+
+        pushTop10(parts, 'tv', tr('nfx_row_top10_tv'));
+
+        parts.push(partTmdb({ title: tr('nfx_row_tv_popular'),  method: 'tv/popular',      life: NFX.cache.short }));
+        parts.push(partTmdb({ title: tr('nfx_row_tv_air'),      method: 'tv/on_the_air',   life: 60 * 6 }));
+        parts.push(partTmdb({ title: tr('nfx_row_tv_today'),    method: 'tv/airing_today', life: 60 * 3 }));
+        parts.push(partTmdb({ title: tr('nfx_row_tv_top'),      method: 'tv/top_rated',    life: NFX.cache.long }));
+
+        pushLampac(parts);
+        pushGenres(parts, 'tv');
+
+        return parts;
+    }
+
+    /** Вкладка «Фильмы» */
+    function partsMovies(){
+        var parts = [];
+
+        parts.push(partContinue());
+
+        parts.push(partTmdb({ title: tr('nfx_row_trending_movie'), method: 'trending/movie/day', filter: 'art', life: 60 * 3 }));
+
+        pushTop10(parts, 'movie', tr('nfx_row_top10_movie'));
+
+        parts.push(partTmdb({ title: tr('nfx_row_new'),       method: 'movie/now_playing', life: NFX.cache.short }));
+        parts.push(partTmdb({ title: tr('nfx_row_acclaimed'), method: 'movie/top_rated',   life: NFX.cache.long }));
+        parts.push(partTmdb({ title: tr('nfx_row_soon'),      method: 'movie/upcoming',    life: NFX.cache.short }));
+        parts.push(partTmdb({ title: tr('nfx_row_popular'),   method: 'movie/popular',     life: NFX.cache.short }));
+
+        pushLampac(parts);
+        pushGenres(parts, 'movie');
+
+        return parts;
+    }
+
+    /** Вкладка «Моё» — только личные списки, без баннера */
+    function partsMy(){
+        var parts = [];
+
+        parts.push(partContinue());
+
+        parts.push(partLocal({
+            title: tr('nfx_row_mylist'),
+            build: function(){ return favoriteCards('book'); },
+            activity: { component: 'favorite', type: 'book', title: tr('nfx_row_mylist') }
+        }));
+
+        parts.push(partLocal({
+            title: tr('nfx_row_liked'),
+            build: function(){ return favoriteCards('like'); },
+            activity: { component: 'favorite', type: 'like', title: tr('nfx_row_liked') }
+        }));
+
+        parts.push(partLocal({
+            title: tr('nfx_row_wath'),
+            build: function(){ return favoriteCards('wath'); },
+            activity: { component: 'favorite', type: 'wath', title: tr('nfx_row_wath') }
+        }));
+
+        parts.push(partLocal({
+            title: tr('nfx_row_history'),
+            build: function(){ return favoriteCards('history'); },
+            activity: { component: 'favorite', type: 'history', title: tr('nfx_row_history') }
+        }));
+
+        var because = partBecause();
+
+        if(because) parts.push(because);
+
+        return parts;
+    }
+
+    /** Полка «Топ-10», если включена в настройках */
+    function pushTop10(parts, type, title){
+        if(!(pref('nfx_top10') === true || pref('nfx_top10') === 'true')) return;
+
+        parts.push(partTmdb({
+            title: title,
+            method: 'trending/' + type + '/day',
+            shape: 'top',
+            rank: true,
+            limit: 10,
+            filter: 'poster',
+            life: 60 * 3
+        }));
+    }
+
+    /** Жанровые полки */
+    function pushGenres(parts, type){
+        NFX.genres.movie.forEach(function(genre){
+            // 16 (мультфильмы) и 10749 (романтика) у сериалов в TMDB другие, но
+            // discover/tv их корректно игнорирует, полка просто окажется пустой
+            parts.push(partTmdb({
+                title: tr(genre.key),
+                method: 'discover/' + type + '?with_genres=' + genre.id + '&sort_by=popularity.desc',
+                life: NFX.cache.long
+            }));
+        });
+    }
+
+    /** Полки каталогов Lampac */
+    function pushLampac(parts){
+        if(!(pref('nfx_lampac_rows') === true || pref('nfx_lampac_rows') === 'true')) return;
+
+        lampacParts().forEach(function(part){ parts.push(part); });
+    }
+
+    /**
+     * Карточки из категории избранного.
+     * @param {string} type book | like | wath | history
+     * @return {array}
+     */
+    function favoriteCards(type){
+        var list = [];
+
+        try { list = Lampa.Favorite.get({ type: type }) || []; }
+        catch(e){ list = []; }
+
+        return uniqueCards(list).slice(0, 20);
+    }
+
+    /**
+     * Полки из подключённых каталогов Lampac.
+     * Каталоги регистрирует плагин Catalog в Lampa.Api.sources.
+     * @return {array}
+     */
+    function lampacParts(){
+        var parts = [];
+
+        try {
+            var sources = Lampa.Api.sources || {};
+
+            // Каталоги регистрируются через Object.defineProperty и не видны в for..in
+            var names = Object.getOwnPropertyNames(sources);
+
+            for(var i = 0; i < names.length; i++){
+                var name = names[i];
+
+                if(name === 'tmdb' || name === 'cub') continue;
+
+                var api = sources[name];
+
+                if(!api || typeof api.getCatalog !== 'function') continue;
+
+                var catalog = null;
+
+                try { catalog = api.getCatalog(); } catch(e){ continue; }
+
+                if(!catalog || !catalog.main) continue;
+
+                for(var title in catalog.main){
+                    parts.push(partLampac(name, title + ' · ' + name.toUpperCase(), catalog.main[title]));
+                }
+            }
+        }
+        catch(e){
+            console.log('NetflixUI', 'lampac rows error:', e.message);
+        }
+
+        return parts;
+    }
+
+    /**
+     * Кандидаты для баннера: топ трендов недели с фоном и описанием.
+     * @param {function} oncomplite
+     */
+    function billboardCards(oncomplite){
+        tmdbGet('trending/all/week', function(json){
+            var list = filterCards(json.results || [], 'art');
+            var out  = [];
+
+            for(var i = 0; i < list.length && out.length < 6; i++){
+                if(list[i].overview && cardTitle(list[i])) out.push(list[i]);
+            }
+
+            oncomplite(out);
+        }, function(){
             oncomplite([]);
-          }
-        }
-
-        network.silent(account(Defined.localhost + 'lite/' + spiderUri + '?title=' + params.query), function(json) {
-          if (json.rch) {
-            rchRun(json, function() {
-              network.silent(account(Defined.localhost + 'lite/' + spiderUri + '?title=' + params.query), function(links) {
-                searchComplite(links);
-              }, function() {
-                oncomplite([]);
-              }, false, {
-			headers: Object.assign({'X-Kit-AesGcm': Lampa.Storage.get('aesgcmkey', '')}, lampacAuthHeaders())
-		  });
-            });
-          } else {
-            searchComplite(json);
-          }
-        }, function() {
-          oncomplite([]);
-        }, false, {
-			headers: Object.assign({'X-Kit-AesGcm': Lampa.Storage.get('aesgcmkey', '')}, lampacAuthHeaders())
-		  });
-      },
-      onCancel: function() {
-        network.clear()
-      },
-      params: {
-        lazy: true,
-        align_left: true,
-        card_events: {
-          onMenu: function() {}
-        }
-      },
-      onMore: function(params, close) {
-        close();
-      },
-      onSelect: function(params, close) {
-        close();
-
-        Lampa.Activity.push({
-          url: params.element.url,
-          title: 'Alpac - ' + params.element.title,
-          component: 'alcopac',
-          movie: params.element,
-          page: 1,
-          search: params.element.title,
-          clarification: true,
-          balanser: params.element.balanser,
-          noinfo: true
-        });
-      }
+        }, 60 * 6);
     }
 
-    Lampa.Search.addSource(source)
-  }
+    /* ---------- арт карточек: кеш, дедупликация, фоновый префетч ---------- */
 
-  function startPlugin() {
-    window.lampac_plugin = true;
-    var manifst = {
-      type: 'video',
-      version: '0.5',
-      name: 'Alpac',
-      description: 'Плагин для просмотра онлайн сериалов и фильмов',
-      component: 'alcopac',
-      onContextMenu: function onContextMenu(object) {
-        return {
-          name: Lampa.Lang.translate('lampac_watch'),
-          description: ''
+    var NFX_ART_EMPTY    = { logo: '', backdrop: '' };
+    var NFX_ART_PARALLEL = 2;
+
+    var nfx_art_cache = {};   // key -> {logo, backdrop}
+    var nfx_art_wait  = {};   // key -> [callbacks] — запрос в полёте
+    var nfx_art_queue = [];   // очередь префетча
+    var nfx_art_busy  = 0;
+    var nfx_art_size  = 0;
+
+    /**
+     * Ключ кеша арта.
+     * @param {object} card
+     * @return {string}
+     */
+    function artKey(card){
+        return (isSerial(card) ? 'tv' : 'mv') + ':' + card.id;
+    }
+
+    /**
+     * Готовый арт из памяти.
+     * @param {object} card
+     * @return {object|null}
+     */
+    function artCached(card){
+        if(!card || !card.id) return null;
+
+        return nfx_art_cache[artKey(card)] || null;
+    }
+
+    /**
+     * Арт карточки: логотип-надпись и кадр 16:9.
+     * У части фильмов backdrop_path в списках пустой, но в /images кадры есть —
+     * забираем оба за один вызов, чтобы не растягивать вертикальный постер.
+     * Если арт уже в памяти — колбэк вызывается синхронно, без задержки.
+     * @param {object} card
+     * @param {function} oncomplite вызывается с {logo, backdrop}
+     */
+    function artwork(card, oncomplite){
+        if(!card || !card.id) return oncomplite(NFX_ART_EMPTY);
+
+        var hit = nfx_art_cache[artKey(card)];
+
+        if(hit) return oncomplite(hit);
+
+        artRequest(card, oncomplite);
+    }
+
+    /**
+     * Запрос арта с дедупликацией: пока запрос в полёте, новые подписчики
+     * просто добавляются к нему.
+     * @param {object} card
+     * @param {function} oncomplite
+     */
+    function artRequest(card, oncomplite){
+        var key = artKey(card);
+
+        if(nfx_art_wait[key]){
+            nfx_art_wait[key].push(oncomplite);
+            return;
+        }
+
+        nfx_art_wait[key] = [oncomplite];
+
+        var type = isSerial(card) ? 'tv' : 'movie';
+        var lang = Lampa.Storage.field('tmdb_lang') || 'ru';
+
+        var done = function(art){
+            // Простая защита от разрастания кеша за долгую сессию
+            if(nfx_art_size > 400){
+                nfx_art_cache = {};
+                nfx_art_size = 0;
+            }
+
+            nfx_art_cache[key] = art;
+            nfx_art_size++;
+
+            var list = nfx_art_wait[key] || [];
+
+            delete nfx_art_wait[key];
+
+            for(var i = 0; i < list.length; i++) list[i](art);
         };
-      },
-      onContextLauch: function onContextLauch(object) {
-        resetTemplates();
-        Lampa.Component.add('alcopac', component);
-		
-		var id = Lampa.Utils.hash(object.number_of_seasons ? object.original_name : object.original_title);
-		var all = Lampa.Storage.get('clarification_search','{}');
-		
-        Lampa.Activity.push({
-          url: '',
-          title: Lampa.Lang.translate('lampac_title_online'),
-          component: 'alcopac',
-          search: all[id] ? all[id] : object.title,
-          search_one: object.title,
-          search_two: object.original_title,
-          movie: object,
-          page: 1,
-		  clarification: all[id] ? true : false
+
+        tmdbGet(type + '/' + card.id + '/images?include_image_language=' + lang + ',en,null', function(json){
+            done({
+                logo: bestLogo(json, lang),
+                backdrop: bestBackdrop(json)
+            });
+        }, function(){
+            done(NFX_ART_EMPTY);
+        }, NFX.cache.long);
+    }
+
+    /**
+     * Поставить карточки в очередь фоновой подгрузки арта, чтобы к моменту
+     * наведения логотип уже был готов.
+     * @param {array} cards
+     */
+    function artPrefetch(cards){
+        if(!cards || !cards.length) return;
+        if(!(pref('nfx_prefetch') === true || pref('nfx_prefetch') === 'true')) return;
+
+        for(var i = 0; i < cards.length; i++){
+            var card = cards[i];
+
+            if(!card || !card.id) continue;
+
+            var key = artKey(card);
+
+            if(nfx_art_cache[key] || nfx_art_wait[key]) continue;
+            if(indexOfKey(nfx_art_queue, key)) continue;
+
+            nfx_art_queue.push(card);
+        }
+
+        artPump();
+    }
+
+    /** Есть ли карточка с таким ключом в очереди */
+    function indexOfKey(queue, key){
+        for(var i = 0; i < queue.length; i++){
+            if(artKey(queue[i]) === key) return true;
+        }
+
+        return false;
+    }
+
+    /** Разбор очереди префетча с ограничением параллелизма */
+    function artPump(){
+        while(nfx_art_busy < NFX_ART_PARALLEL && nfx_art_queue.length){
+            var card = nfx_art_queue.shift();
+
+            nfx_art_busy++;
+
+            artRequest(card, function(art){
+                nfx_art_busy--;
+
+                // Логотип небольшой — прогреваем всегда
+                if(art && art.logo) artWarm(art.logo);
+
+                setTimeout(artPump, 120);
+            });
+        }
+    }
+
+    /** Сбросить очередь префетча (смена вкладки, уход с экрана) */
+    function artPrefetchClear(){
+        nfx_art_queue = [];
+    }
+
+    var nfx_warm = {};
+
+    /**
+     * Прогреть картинку в кеше браузера, чтобы подмена шла без видимой загрузки.
+     * @param {string} url
+     */
+    function artWarm(url){
+        if(!url || nfx_warm[url]) return;
+
+        nfx_warm[url] = true;
+
+        var image = new Image();
+
+        image.src = url;
+    }
+
+    /**
+     * Прогреть кадры 16:9 у карточек рядом с курсором.
+     * Кадр весит на порядок больше логотипа, поэтому окно узкое.
+     * @param {array} cards
+     */
+    function artWarmBackdrops(cards){
+        if(!cards || !cards.length) return;
+        if(!(pref('nfx_prefetch') === true || pref('nfx_prefetch') === 'true')) return;
+
+        for(var i = 0; i < cards.length; i++){
+            var card = cards[i];
+
+            if(!card) continue;
+
+            if(card.backdrop_path){
+                artWarm(img(card.backdrop_path, 'w780'));
+                continue;
+            }
+
+            // Кадра в списке нет — берём из уже полученного арта, если он есть
+            var art = artCached(card);
+
+            if(art && art.backdrop) artWarm(art.backdrop);
+        }
+    }
+
+    /**
+     * Лучший логотип: приоритет языку интерфейса, SVG пропускаем —
+     * старые webview рисуют его непредсказуемо.
+     * @param {object} json ответ /images
+     * @param {string} lang
+     * @return {string}
+     */
+    function bestLogo(json, lang){
+        var logos = (json && json.logos) || [];
+        var best  = null;
+
+        for(var i = 0; i < logos.length; i++){
+            var logo = logos[i];
+
+            if(('' + logo.file_path).indexOf('.svg') > -1) continue;
+
+            if(!best) best = logo;
+            else if(logo.iso_639_1 === lang && best.iso_639_1 !== lang) best = logo;
+        }
+
+        return best ? img(best.file_path, 'w500') : '';
+    }
+
+    /**
+     * Лучший кадр 16:9: без надписей (iso_639_1 = null) и максимально рейтинговый.
+     * @param {object} json ответ /images
+     * @return {string}
+     */
+    function bestBackdrop(json){
+        var list = (json && json.backdrops) || [];
+        var best = null;
+
+        for(var i = 0; i < list.length; i++){
+            var item = list[i];
+
+            if(!item.file_path) continue;
+
+            // Кадры с вшитым текстом на чужом языке смотрятся хуже нейтральных
+            var neutral = !item.iso_639_1;
+
+            if(!best) best = item;
+            else {
+                var best_neutral = !best.iso_639_1;
+
+                if(neutral && !best_neutral) best = item;
+                else if(neutral === best_neutral && (item.vote_average || 0) > (best.vote_average || 0)) best = item;
+            }
+        }
+
+        return best ? img(best.file_path, 'w780') : '';
+    }
+
+    /**
+     * Логотип-надпись названия (title treatment) — для баннера.
+     * @param {object} card
+     * @param {function} oncomplite вызывается с url или ''
+     */
+    function titleLogo(card, oncomplite){
+        artwork(card, function(art){
+            oncomplite(art.logo);
         });
-      }
+    }
+
+    /**
+     * Последний просмотренный эпизод сериала.
+     * @param {object} card
+     * @return {object|null} {season, episode}
+     */
+    function lastEpisode(card){
+        try {
+            var last = Lampa.Storage.get('online_watched_last', '{}') || {};
+            var keys = [card.original_title, card.original_name, card.title, card.name];
+
+            for(var i = 0; i < keys.length; i++){
+                if(!keys[i]) continue;
+
+                var found = last[Lampa.Utils.hash(keys[i])];
+
+                if(found && found.episode) return { season: found.season || 1, episode: found.episode };
+            }
+        }
+        catch(e){}
+
+        // Фолбэк: последний эпизод с прогрессом из таймлайна
+        try {
+            var list = Lampa.Timeline.watched(card, true);
+
+            if(list && list.length){
+                var item = list[list.length - 1];
+
+                if(item && item.ep) return { season: 1, episode: item.ep };
+            }
+        }
+        catch(e){}
+
+        return null;
+    }
+
+    /**
+     * «Осталось 20 мин» по данным таймлайна.
+     * @param {object} view {percent, time, duration}
+     * @return {string} пустая строка, если данных нет
+     */
+    function leftTime(view){
+        if(!view || !view.duration || !view.time) return '';
+
+        var left = Math.round((view.duration - view.time) / 60);
+
+        if(left <= 0) return '';
+
+        if(left < 60) return tr('nfx_left').replace('%s', left + ' ' + tr('nfx_min'));
+
+        var hours = Math.floor(left / 60);
+        var mins  = left % 60;
+
+        return tr('nfx_left').replace('%s', hours + ' ' + tr('nfx_hour') + (mins ? ' ' + mins + ' ' + tr('nfx_min') : ''));
+    }
+
+    /**
+     * Строка «Жанр · Год · Сезоны · Рейтинг» — как в презентации Netflix.
+     * @param {object} card
+     * @return {string}
+     */
+    function infoLine(card){
+        var parts  = [];
+        var genres = genreNames(card);
+        var year   = cardYear(card);
+
+        if(genres) parts.push(genres);
+        if(year) parts.push(year);
+
+        if(card.number_of_seasons){
+            parts.push(card.number_of_seasons + ' ' + seasonWord(card.number_of_seasons));
+        }
+
+        parts.push(ageLimit(card));
+
+        return parts.join(' • ');
+    }
+
+    /**
+     * Склонение слова «сезон».
+     * @param {number} count
+     * @return {string}
+     */
+    function seasonWord(count){
+        if(!Lampa.Lang.selected(['ru', 'uk', 'be'])) return count === 1 ? 'season' : 'seasons';
+
+        var last = count % 10;
+        var tens = count % 100;
+
+        if(tens > 10 && tens < 20) return 'сезонов';
+        if(last === 1) return 'сезон';
+        if(last >= 2 && last <= 4) return 'сезона';
+
+        return 'сезонов';
+    }
+
+    /**
+     * Название эпизода из TMDB (кешируется на неделю).
+     * @param {object} card
+     * @param {number} season
+     * @param {number} episode
+     * @param {function} oncomplite
+     */
+    function episodeName(card, season, episode, oncomplite){
+        if(!card.id) return oncomplite('');
+
+        tmdbGet('tv/' + card.id + '/season/' + season, function(json){
+            var list = (json && json.episodes) || [];
+
+            for(var i = 0; i < list.length; i++){
+                if(list[i].episode_number == episode) return oncomplite(list[i].name || '');
+            }
+
+            oncomplite('');
+        }, function(){
+            oncomplite('');
+        }, NFX.cache.long);
+    }
+
+    /**
+     * Две строки метаданных под раскрытой карточкой — как на Netflix.
+     * @param {object} card
+     * @param {function} onUpdate вызывается позже, когда подтянется название эпизода
+     * @return {object} {line1, line2}
+     */
+    function watchMeta(card, onUpdate){
+        var title = cardTitle(card);
+        var meta  = { line1: title, line2: '' };
+        var view;
+
+        if(isSerial(card)){
+            var last = lastEpisode(card);
+
+            if(last){
+                meta.line1 = 'S' + last.season + ' E' + last.episode;
+
+                try { view = Lampa.Timeline.watchedEpisode(card, last.season, last.episode, true); }
+                catch(e){ view = null; }
+
+                meta.line2 = leftTime(view) || title;
+
+                if(onUpdate){
+                    episodeName(card, last.season, last.episode, function(name){
+                        if(name) onUpdate({ line1: meta.line1 + ' • ' + name, line2: meta.line2 });
+                    });
+                }
+
+                return meta;
+            }
+        }
+        else {
+            try { view = Lampa.Timeline.watched(card, true); }
+            catch(e){ view = null; }
+
+            var left = leftTime(view);
+
+            if(left){
+                meta.line2 = left;
+
+                return meta;
+            }
+        }
+
+        // Обычная полка: как в презентации — метастрока сверху, синопсис снизу
+        meta.line1 = infoLine(card);
+        meta.line2 = cut(card.overview, 190);
+
+        return meta;
+    }
+
+    /** Отменить все запросы плагина */
+    function apiClear(){
+        artPrefetchClear();
+
+        if(nfx_network) nfx_network.clear();
+    }
+
+    /* ---------- src/nav.js ---------- */
+    /**
+     * Верхняя панель навигации в стиле Netflix TV:
+     * аватар профиля, поиск, вкладки, логотип справа.
+     * @param {object} params {tab:string}
+     */
+    function NfxNav(params){
+        var _self = this;
+
+        this.params = params || {};
+
+        var active = this.params.tab || 'home';
+        var last   = false;
+
+        var ICON_SEARCH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">' +
+            '<circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.4 15.4L21 21"/></svg>';
+
+        // Дефолтный аватар: красная плитка с рожицей, если нет профиля CUB
+        var ICON_FACE = '<svg viewBox="0 0 40 40"><rect width="40" height="40" rx="4" fill="#e50914"/>' +
+            '<rect x="11" y="13" width="4" height="7" rx="2" fill="#fff"/>' +
+            '<rect x="25" y="13" width="4" height="7" rx="2" fill="#fff"/>' +
+            '<path d="M12 24c2.6 3.2 5.3 4.8 8 4.8s5.4-1.6 8-4.8" stroke="#fff" stroke-width="3" stroke-linecap="round" fill="none"/></svg>';
+
+        /** Вкладки: search — не вкладка, а действие */
+        var TABS = [
+            { key: 'search', icon: ICON_SEARCH },
+            { key: 'home',   title: 'nfx_tab_home' },
+            { key: 'shows',  title: 'nfx_tab_shows' },
+            { key: 'movies', title: 'nfx_tab_movies' },
+            { key: 'my',     title: 'nfx_tab_my' }
+        ];
+
+        /** Собрать DOM */
+        this.create = function(){
+            var html = '<div class="nfx-nav">' +
+                '<div class="nfx-nav__side">' +
+                    '<div class="nfx-nav__profile selector">' +
+                        '<div class="nfx-nav__avatar">' + ICON_FACE + '</div>' +
+                        '<div class="nfx-nav__caret">▾</div>' +
+                    '</div>' +
+                '</div>' +
+                '<div class="nfx-nav__center"></div>' +
+                '<div class="nfx-nav__side nfx-nav__side--right"></div>' +
+            '</div>';
+
+            this.html = $(html);
+
+            var center = this.html.find('.nfx-nav__center');
+
+            TABS.forEach(function(tab){
+                var item = $('<div class="nfx-nav__item' + (tab.icon ? ' nfx-nav__item--icon' : '') + ' selector" data-key="' + tab.key + '">' +
+                    (tab.icon ? tab.icon : esc(tr(tab.title))) +
+                '</div>');
+
+                item.on('hover:enter', function(){
+                    _self.select(tab.key);
+                });
+
+                item.on('hover:focus', function(){
+                    last = item[0];
+                });
+
+                center.append(item);
+            });
+
+            this.html.find('.nfx-nav__profile')
+                .on('hover:enter', function(){ _self.profile(); })
+                .on('hover:focus', function(){ last = _self.html.find('.nfx-nav__profile')[0]; });
+
+            this.avatar();
+            this.setActive(active);
+
+            return this;
+        };
+
+        /** Подставить иконку профиля CUB, если он есть */
+        this.avatar = function(){
+            var src = '';
+
+            try {
+                if(Lampa.Account && Lampa.Account.Profile && Lampa.Account.Permit && Lampa.Account.Permit.token){
+                    src = Lampa.Account.Profile.icon();
+                }
+            }
+            catch(e){}
+
+            if(!src) return;
+
+            var box = this.html.find('.nfx-nav__avatar');
+            var img_el = document.createElement('img');
+
+            img_el.onload = function(){
+                box.empty();
+                box.append(img_el);
+            };
+
+            img_el.src = src;
+        };
+
+        /**
+         * Отметить активную вкладку.
+         * @param {string} key
+         */
+        this.setActive = function(key){
+            active = key;
+
+            this.html.find('.nfx-nav__item').each(function(){
+                $(this).toggleClass('nfx-nav__item--active', $(this).data('key') === key);
+            });
+        };
+
+        /**
+         * Выбор вкладки.
+         * @param {string} key
+         */
+        this.select = function(key){
+            if(key === 'search'){
+                try { Lampa.Search.open({ onBack: function(){ Lampa.Controller.toggle('content'); } }); }
+                catch(e){ Lampa.Controller.toggle('search'); }
+
+                return;
+            }
+
+            if(key === active) return;
+
+            this.setActive(key);
+
+            if(this.onSelect) this.onSelect(key);
+        };
+
+        /** Меню профиля: доступ к тому, что спрятала шапка Lampa */
+        this.profile = function(){
+            var enabled = Lampa.Controller.enabled().name;
+            var items   = [
+                { title: tr('nfx_nav_menu'), action: 'menu' },
+                { title: Lampa.Lang.translate('menu_settings'), action: 'settings' }
+            ];
+
+            var synced = false;
+
+            try { synced = !!(Lampa.Account && Lampa.Account.Permit && Lampa.Account.Permit.token); }
+            catch(e){}
+
+            if(synced) items.push({ title: tr('nfx_nav_profiles'), action: 'profiles' });
+
+            Lampa.Select.show({
+                title: Lampa.Lang.translate('title_action'),
+                items: items,
+                onSelect: function(item){
+                    if(item.action === 'menu'){
+                        Lampa.Controller.toggle('menu');
+                        return;
+                    }
+
+                    if(item.action === 'settings'){
+                        Lampa.Controller.toggle('settings');
+                        return;
+                    }
+
+                    if(item.action === 'profiles'){
+                        Lampa.Account.Profile.select(function(){
+                            Lampa.Controller.toggle(enabled);
+                        });
+                        return;
+                    }
+
+                    Lampa.Controller.toggle(enabled);
+                },
+                onBack: function(){
+                    Lampa.Controller.toggle(enabled);
+                }
+            });
+        };
+
+        /** Забрать фокус на панель */
+        this.toggle = function(){
+            var box = this.html[0];
+
+            Lampa.Controller.add('nfx_nav', {
+                link: this,
+                toggle: function(){
+                    Lampa.Controller.collectionSet(box);
+                    Lampa.Controller.collectionFocus(last || _self.html.find('.nfx-nav__item--active')[0] || false, box);
+                },
+                right: function(){
+                    Navigator.move('right');
+                },
+                left: function(){
+                    if(Navigator.canmove('left')) Navigator.move('left');
+                    else Lampa.Controller.toggle('menu');
+                },
+                up: function(){},
+                down: function(){
+                    if(_self.onDown) _self.onDown();
+                },
+                back: function(){
+                    if(_self.onBack) _self.onBack();
+                }
+            });
+
+            Lampa.Controller.toggle('nfx_nav');
+        };
+
+        this.render = function(js){
+            return js ? this.html[0] : this.html;
+        };
+
+        this.destroy = function(){
+            if(this.html) this.html.remove();
+
+            this.html = null;
+        };
+    }
+
+    /* ---------- src/trailer.js ---------- */
+    /**
+     * Трейлер внутри раскрытой карточки.
+     * YT IFrame API Lampa по умолчанию не подключает, поэтому грузим сами.
+     * Плеер создаётся на карточку и уничтожается при уходе фокуса: перенос
+     * iframe между карточками в DOM вызывает его перезагрузку, так что
+     * переиспользовать один инстанс нельзя.
+     */
+
+    var NFX_TR = {
+        api: 'idle',     // idle | loading | ready | failed
+        player: null,
+        host: null,
+        card: null,      // DOM-элемент карточки, на которой играет трейлер
+        timer: null,
+        guard: null,
+        tick: null,
+        ramp: null
     };
-	addSourceSearch('Spider', 'spider');
-	addSourceSearch('Anime', 'spider/anime');
 
-	// YouTube search source — directly queries /lite/youtube and shows results
-	(function(){
-		var ytNet = new Lampa.Reguest();
-		var ytSource = {
-			title: 'YouTube',
-			search: function(params, oncomplite){
-				ytNet.silent(account(Defined.localhost + 'lite/youtube?title=' + params.query + '&rjson=true'), function(json){
-					if(json && json.data && json.data.length){
-						var cards = json.data.map(function(item){
-							return {
-								title: item.name || item.title,
-								original_title: item.title,
-								img: item.img || '',
-								youtube: true,
-								yt_call_url: item.url,
-								balanser: 'youtube'
-							};
-						});
-						oncomplite([{title:'YouTube', results: cards}]);
-					} else {
-						oncomplite([]);
-					}
-				}, function(){
-					oncomplite([]);
-				}, false, {headers:{'X-Kit-AesGcm': Lampa.Storage.get('aesgcmkey','')}});
-			},
-			onCancel: function(){ ytNet.clear(); },
-			params: { lazy: true, align_left: true, card_events: { onMenu: function(){} } },
-			onMore: function(params, close){ close(); },
-			onSelect: function(params, close){
-				close();
-				var el = params.element;
-				if(el.yt_call_url){
-					// Fetch the stream URL and play directly
-					ytNet.silent(account(el.yt_call_url + '&rjson=true'), function(json){
-						if(json && json.data && json.data.length && json.data[0].stream){
-							Lampa.Player.play({
-								title: el.title || '',
-								url: json.data[0].stream
-							});
-							Lampa.Player.playlist([{
-								title: el.title || '',
-								url: json.data[0].stream
-							}]);
-						} else {
-							Lampa.Noty.show('YouTube: не удалось получить видео');
-						}
-					}, function(){
-						Lampa.Noty.show('YouTube: ошибка загрузки');
-					}, false, {headers:{'X-Kit-AesGcm': Lampa.Storage.get('aesgcmkey','')}});
-				}
-			}
-		};
-		Lampa.Search.addSource(ytSource);
-	})();
-    Lampa.Manifest.plugins = manifst;
-    Lampa.Lang.add({
-      lampac_watch: { //
-        ru: 'Смотреть онлайн',
-        en: 'Watch online',
-        uk: 'Дивитися онлайн',
-        zh: '在线观看'
-      },
-      lampac_video: { //
-        ru: 'Видео',
-        en: 'Video',
-        uk: 'Відео',
-        zh: '视频'
-      },
-      lampac_no_watch_history: {
-        ru: 'Нет истории просмотра',
-        en: 'No browsing history',
-        ua: 'Немає історії перегляду',
-        zh: '没有浏览历史'
-      },
-      lampac_nolink: {
-        ru: 'Не удалось извлечь ссылку',
-        uk: 'Неможливо отримати посилання',
-        en: 'Failed to fetch link',
-        zh: '获取链接失败'
-      },
-      lampac_balanser: { //
-        ru: 'Источник',
-        uk: 'Джерело',
-        en: 'Source',
-        zh: '来源'
-      },
-      helper_online_file: { //
-        ru: 'Удерживайте клавишу "ОК" для вызова контекстного меню',
-        uk: 'Утримуйте клавішу "ОК" для виклику контекстного меню',
-        en: 'Hold the "OK" key to bring up the context menu',
-        zh: '按住“确定”键调出上下文菜单'
-      },
-      lampac_title_online: { ru: 'Alpac Онлайн', uk: 'Alpac Онлайн', en: 'Alpac Online', zh: 'Alpac 在线' },
-      lampac_voice_subscribe: { //
-        ru: 'Подписаться на перевод',
-        uk: 'Підписатися на переклад',
-        en: 'Subscribe to translation',
-        zh: '订阅翻译'
-      },
-      lampac_voice_success: { //
-        ru: 'Вы успешно подписались',
-        uk: 'Ви успішно підписалися',
-        en: 'You have successfully subscribed',
-        zh: '您已成功订阅'
-      },
-      lampac_voice_error: { //
-        ru: 'Возникла ошибка',
-        uk: 'Виникла помилка',
-        en: 'An error has occurred',
-        zh: '发生了错误'
-      },
-      lampac_clear_all_marks: { //
-        ru: 'Очистить все метки',
-        uk: 'Очистити всі мітки',
-        en: 'Clear all labels',
-        zh: '清除所有标签'
-      },
-      lampac_clear_all_timecodes: { //
-        ru: 'Очистить все тайм-коды',
-        uk: 'Очистити всі тайм-коди',
-        en: 'Clear all timecodes',
-        zh: '清除所有时间代码'
-      },
-      lampac_change_balanser: { //
-        ru: 'Изменить балансер',
-        uk: 'Змінити балансер',
-        en: 'Change balancer',
-        zh: '更改平衡器'
-      },
-      lampac_balanser_dont_work: { //
-        ru: 'Поиск на ({balanser}) не дал результатов',
-        uk: 'Пошук на ({balanser}) не дав результатів',
-        en: 'Search on ({balanser}) did not return any results',
-        zh: '搜索 ({balanser}) 未返回任何结果'
-      },
-      lampac_balanser_timeout: { //
-        ru: 'Источник будет переключен автоматически через <span class="timeout">10</span> секунд.',
-        uk: 'Джерело буде автоматично переключено через <span class="timeout">10</span> секунд.',
-        en: 'The source will be switched automatically after <span class="timeout">10</span> seconds.',
-        zh: '平衡器将在<span class="timeout">10</span>秒内自动切换。'
-      },
-      lampac_does_not_answer_text: {
-        ru: 'Поиск на ({balanser}) не дал результатов',
-        uk: 'Пошук на ({balanser}) не дав результатів',
-        en: 'Search on ({balanser}) did not return any results',
-        zh: '搜索 ({balanser}) 未返回任何结果'
-      }
-    });
-    Lampa.Template.add('lampac_css', "\n        <style>\n        @charset 'UTF-8';.online-prestige{position:relative;-webkit-border-radius:.3em;border-radius:.3em;background-color:rgba(0,0,0,0.3);display:-webkit-box;display:-webkit-flex;display:-moz-box;display:-ms-flexbox;display:flex}.online-prestige__body{padding:1.2em;line-height:1.3;-webkit-box-flex:1;-webkit-flex-grow:1;-moz-box-flex:1;-ms-flex-positive:1;flex-grow:1;position:relative}@media screen and (max-width:480px){.online-prestige__body{padding:.8em 1.2em}}.online-prestige__img{position:relative;width:13em;-webkit-flex-shrink:0;-ms-flex-negative:0;flex-shrink:0;min-height:8.2em}.online-prestige__img>img{position:absolute;top:0;left:0;width:100%;height:100%;-o-object-fit:cover;object-fit:cover;-webkit-border-radius:.3em;border-radius:.3em;opacity:0;-webkit-transition:opacity .3s;-o-transition:opacity .3s;-moz-transition:opacity .3s;transition:opacity .3s}.online-prestige__img--loaded>img{opacity:1}@media screen and (max-width:480px){.online-prestige__img{width:7em;min-height:6em}}.online-prestige__folder{padding:1em;-webkit-flex-shrink:0;-ms-flex-negative:0;flex-shrink:0}.online-prestige__folder>svg{width:4.4em !important;height:4.4em !important}.online-prestige__viewed{position:absolute;top:1em;left:1em;background:rgba(0,0,0,0.45);-webkit-border-radius:100%;border-radius:100%;padding:.25em;font-size:.76em}.online-prestige__viewed>svg{width:1.5em !important;height:1.5em !important}.online-prestige__episode-number{position:absolute;top:0;left:0;right:0;bottom:0;display:-webkit-box;display:-webkit-flex;display:-moz-box;display:-ms-flexbox;display:flex;-webkit-box-align:center;-webkit-align-items:center;-moz-box-align:center;-ms-flex-align:center;align-items:center;-webkit-box-pack:center;-webkit-justify-content:center;-moz-box-pack:center;-ms-flex-pack:center;justify-content:center;font-size:2em}.online-prestige__loader{position:absolute;top:50%;left:50%;width:2em;height:2em;margin-left:-1em;margin-top:-1em;background:url(./img/loader.svg) no-repeat center center;-webkit-background-size:contain;-o-background-size:contain;background-size:contain}.online-prestige__head,.online-prestige__footer{display:-webkit-box;display:-webkit-flex;display:-moz-box;display:-ms-flexbox;display:flex;-webkit-box-pack:justify;-webkit-justify-content:space-between;-moz-box-pack:justify;-ms-flex-pack:justify;justify-content:space-between;-webkit-box-align:center;-webkit-align-items:center;-moz-box-align:center;-ms-flex-align:center;align-items:center}.online-prestige__timeline{margin:.8em 0}.online-prestige__timeline>.time-line{display:block !important}.online-prestige__title{font-size:1.7em;overflow:hidden;-o-text-overflow:ellipsis;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:1;line-clamp:1;-webkit-box-orient:vertical}@media screen and (max-width:480px){.online-prestige__title{font-size:1.4em}}.online-prestige__time{padding-left:2em}.online-prestige__info{display:-webkit-box;display:-webkit-flex;display:-moz-box;display:-ms-flexbox;display:flex;-webkit-box-align:center;-webkit-align-items:center;-moz-box-align:center;-ms-flex-align:center;align-items:center}.online-prestige__info>*{overflow:hidden;-o-text-overflow:ellipsis;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:1;line-clamp:1;-webkit-box-orient:vertical}.online-prestige__quality{padding-left:1em;white-space:nowrap}.online-prestige__scan-file{position:absolute;bottom:0;left:0;right:0}.online-prestige__scan-file .broadcast__scan{margin:0}.online-prestige .online-prestige-split{font-size:.8em;margin:0 1em;-webkit-flex-shrink:0;-ms-flex-negative:0;flex-shrink:0}.online-prestige.focus::after{content:'';position:absolute;top:-0.6em;left:-0.6em;right:-0.6em;bottom:-0.6em;-webkit-border-radius:.7em;border-radius:.7em;border:solid .3em #fff;z-index:-1;pointer-events:none}.online-prestige+.online-prestige{margin-top:1.5em}.online-prestige--folder .online-prestige__footer{margin-top:.8em}.online-prestige-watched{padding:1em}.online-prestige-watched__icon>svg{width:1.5em;height:1.5em}.online-prestige-watched__body{padding-left:1em;padding-top:.1em;display:-webkit-box;display:-webkit-flex;display:-moz-box;display:-ms-flexbox;display:flex;-webkit-flex-wrap:wrap;-ms-flex-wrap:wrap;flex-wrap:wrap}.online-prestige-watched__body>span+span::before{content:' ● ';vertical-align:top;display:inline-block;margin:0 .5em}.online-prestige-rate{display:-webkit-inline-box;display:-webkit-inline-flex;display:-moz-inline-box;display:-ms-inline-flexbox;display:inline-flex;-webkit-box-align:center;-webkit-align-items:center;-moz-box-align:center;-ms-flex-align:center;align-items:center}.online-prestige-rate>svg{width:1.3em !important;height:1.3em !important}.online-prestige-rate>span{font-weight:600;font-size:1.1em;padding-left:.7em}.online-empty{line-height:1.4}.online-empty__title{font-size:1.8em;margin-bottom:.3em}.online-empty__time{font-size:1.2em;font-weight:300;margin-bottom:1.6em}.online-empty__buttons{display:-webkit-box;display:-webkit-flex;display:-moz-box;display:-ms-flexbox;display:flex}.online-empty__buttons>*+*{margin-left:1em}.online-empty__button{background:rgba(0,0,0,0.3);font-size:1.2em;padding:.5em 1.2em;-webkit-border-radius:.2em;border-radius:.2em;margin-bottom:2.4em}.online-empty__button.focus{background:#fff;color:black}.online-empty__templates .online-empty-template:nth-child(2){opacity:.5}.online-empty__templates .online-empty-template:nth-child(3){opacity:.2}.online-empty-template{background-color:rgba(255,255,255,0.3);padding:1em;display:-webkit-box;display:-webkit-flex;display:-moz-box;display:-ms-flexbox;display:flex;-webkit-box-align:center;-webkit-align-items:center;-moz-box-align:center;-ms-flex-align:center;align-items:center;-webkit-border-radius:.3em;border-radius:.3em}.online-empty-template>*{background:rgba(0,0,0,0.3);-webkit-border-radius:.3em;border-radius:.3em}.online-empty-template__ico{width:4em;height:4em;margin-right:2.4em}.online-empty-template__body{height:1.7em;width:70%}.online-empty-template+.online-empty-template{margin-top:1em}\n        </style>\n    ");
-    $('body').append(Lampa.Template.get('lampac_css', {}, true));
+    /** Кеш ключей трейлеров: key -> videoId | '' */
+    var nfx_vid_cache = {};
 
-    function resetTemplates() {
-      Lampa.Template.add('lampac_prestige_full', "<div class=\"online-prestige online-prestige--full selector\">\n            <div class=\"online-prestige__img\">\n                <img alt=\"\">\n                <div class=\"online-prestige__loader\"></div>\n            </div>\n            <div class=\"online-prestige__body\">\n                <div class=\"online-prestige__head\">\n                    <div class=\"online-prestige__title\">{title}</div>\n                    <div class=\"online-prestige__time\">{time}</div>\n                </div>\n\n                <div class=\"online-prestige__timeline\"></div>\n\n                <div class=\"online-prestige__footer\">\n                    <div class=\"online-prestige__info\">{info}</div>\n                    <div class=\"online-prestige__quality\">{quality}</div>\n                </div>\n            </div>\n        </div>");
-      Lampa.Template.add('lampac_content_loading', "<div class=\"online-empty\">\n            <div class=\"broadcast__scan\"><div></div></div>\n\t\t\t\n            <div class=\"online-empty__templates\">\n                <div class=\"online-empty-template selector\">\n                    <div class=\"online-empty-template__ico\"></div>\n                    <div class=\"online-empty-template__body\"></div>\n                </div>\n                <div class=\"online-empty-template\">\n                    <div class=\"online-empty-template__ico\"></div>\n                    <div class=\"online-empty-template__body\"></div>\n                </div>\n                <div class=\"online-empty-template\">\n                    <div class=\"online-empty-template__ico\"></div>\n                    <div class=\"online-empty-template__body\"></div>\n                </div>\n            </div>\n        </div>");
-      Lampa.Template.add('lampac_does_not_answer', "<div class=\"online-empty\">\n            <div class=\"online-empty__title\">\n                #{lampac_balanser_dont_work}\n            </div>\n            <div class=\"online-empty__time\">\n                #{lampac_balanser_timeout}\n            </div>\n            <div class=\"online-empty__buttons\">\n                <div class=\"online-empty__button selector cancel\">#{cancel}</div>\n                <div class=\"online-empty__button selector change\">#{lampac_change_balanser}</div>\n            </div>\n            <div class=\"online-empty__templates\">\n                <div class=\"online-empty-template\">\n                    <div class=\"online-empty-template__ico\"></div>\n                    <div class=\"online-empty-template__body\"></div>\n                </div>\n                <div class=\"online-empty-template\">\n                    <div class=\"online-empty-template__ico\"></div>\n                    <div class=\"online-empty-template__body\"></div>\n                </div>\n                <div class=\"online-empty-template\">\n                    <div class=\"online-empty-template__ico\"></div>\n                    <div class=\"online-empty-template__body\"></div>\n                </div>\n            </div>\n        </div>");
-      Lampa.Template.add('lampac_prestige_rate', "<div class=\"online-prestige-rate\">\n            <svg width=\"17\" height=\"16\" viewBox=\"0 0 17 16\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n                <path d=\"M8.39409 0.192139L10.99 5.30994L16.7882 6.20387L12.5475 10.4277L13.5819 15.9311L8.39409 13.2425L3.20626 15.9311L4.24065 10.4277L0 6.20387L5.79819 5.30994L8.39409 0.192139Z\" fill=\"#fff\"></path>\n            </svg>\n            <span>{rate}</span>\n        </div>");
-      Lampa.Template.add('lampac_prestige_folder', "<div class=\"online-prestige online-prestige--folder selector\">\n            <div class=\"online-prestige__folder\">\n                <svg viewBox=\"0 0 128 112\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n                    <rect y=\"20\" width=\"128\" height=\"92\" rx=\"13\" fill=\"white\"></rect>\n                    <path d=\"M29.9963 8H98.0037C96.0446 3.3021 91.4079 0 86 0H42C36.5921 0 31.9555 3.3021 29.9963 8Z\" fill=\"white\" fill-opacity=\"0.23\"></path>\n                    <rect x=\"11\" y=\"8\" width=\"106\" height=\"76\" rx=\"13\" fill=\"white\" fill-opacity=\"0.51\"></rect>\n                </svg>\n            </div>\n            <div class=\"online-prestige__body\">\n                <div class=\"online-prestige__head\">\n                    <div class=\"online-prestige__title\">{title}</div>\n                    <div class=\"online-prestige__time\">{time}</div>\n                </div>\n\n                <div class=\"online-prestige__footer\">\n                    <div class=\"online-prestige__info\">{info}</div>\n                </div>\n            </div>\n        </div>");
-      Lampa.Template.add('lampac_prestige_watched', "<div class=\"online-prestige online-prestige-watched selector\">\n            <div class=\"online-prestige-watched__icon\">\n                <svg width=\"21\" height=\"21\" viewBox=\"0 0 21 21\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n                    <circle cx=\"10.5\" cy=\"10.5\" r=\"9\" stroke=\"currentColor\" stroke-width=\"3\"/>\n                    <path d=\"M14.8477 10.5628L8.20312 14.399L8.20313 6.72656L14.8477 10.5628Z\" fill=\"currentColor\"/>\n                </svg>\n            </div>\n            <div class=\"online-prestige-watched__body\">\n                \n            </div>\n        </div>");
+    /** Включён ли трейлер и с какой задержкой, мс. 0 — выключен */
+    function trailerDelay(){
+        var value = parseInt(pref('nfx_trailer'), 10);
+
+        return isNaN(value) ? 0 : value * 1000;
     }
-    var button = "<div class=\"full-start__button selector view--online lampac--button\" data-subtitle=\"".concat(manifst.name, " v").concat(manifst.version, "\">\n        <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\" fill=\"currentColor\">\n            <path d=\"M21 9 L17 0 L26 7 Z\"></path>\n            <path d=\"M31 9 L35 0 L26 7 Z\"></path>\n            <ellipse cx=\"26\" cy=\"13\" rx=\"7\" ry=\"6\"></ellipse>\n            <path d=\"M21 17 L18 32 L34 32 L31 17 Z\"></path>\n            <rect x=\"10\" y=\"30\" width=\"46\" height=\"26\" rx=\"8\"></rect>\n            <rect x=\"19\" y=\"55\" width=\"4\" height=\"7\" rx=\"1\"></rect>\n            <rect x=\"27\" y=\"55\" width=\"4\" height=\"7\" rx=\"1\"></rect>\n            <rect x=\"35\" y=\"55\" width=\"4\" height=\"7\" rx=\"1\"></rect>\n            <rect x=\"43\" y=\"55\" width=\"4\" height=\"7\" rx=\"1\"></rect>\n        </svg>\n\n        <span>#{lampac_title_online}</span>\n    </div>"); // нужна заглушка, а то при страте лампы говорит пусто
-    Lampa.Component.add('alcopac', component); //то же самое
-    resetTemplates();
 
-    function addButton(e) {
-      if (e.render.find('.lampac--button').length) return;
-      var btn = $(Lampa.Lang.translate(button));
-	  // //console.log(btn.clone().removeClass('focus').prop('outerHTML'))
-      btn.on('hover:enter', function() {
-        resetTemplates();
-        Lampa.Component.add('alcopac', component);
-		
-		var id = Lampa.Utils.hash(e.movie.number_of_seasons ? e.movie.original_name : e.movie.original_title);
-		var all = Lampa.Storage.get('clarification_search','{}');
-		
+    /** Нужен ли звук */
+    function trailerSound(){
+        var value = pref('nfx_trailer_sound');
+
+        return value === true || value === 'true';
+    }
+
+    /**
+     * Ленивая загрузка YT IFrame API.
+     * @param {function} oncomplite вызывается с true/false
+     */
+    function trailerApi(oncomplite){
+        if(NFX_TR.api === 'ready')  return oncomplite(true);
+        if(NFX_TR.api === 'failed') return oncomplite(false);
+
+        if(window.YT && window.YT.Player){
+            NFX_TR.api = 'ready';
+
+            return oncomplite(true);
+        }
+
+        if(NFX_TR.api === 'loading'){
+            // Ждём уже идущую загрузку
+            var waited = 0;
+            var wait = setInterval(function(){
+                waited += 200;
+
+                if(window.YT && window.YT.Player){
+                    clearInterval(wait);
+                    NFX_TR.api = 'ready';
+
+                    return oncomplite(true);
+                }
+
+                if(waited > 8000 || NFX_TR.api === 'failed'){
+                    clearInterval(wait);
+
+                    oncomplite(false);
+                }
+            }, 200);
+
+            return;
+        }
+
+        NFX_TR.api = 'loading';
+
+        // Не затираем обработчик, если его уже кто-то поставил
+        var previous = window.onYouTubeIframeAPIReady;
+
+        window.onYouTubeIframeAPIReady = function(){
+            if(typeof previous === 'function') previous();
+
+            NFX_TR.api = 'ready';
+        };
+
+        var script = document.createElement('script');
+
+        script.src = Lampa.Utils.protocol() + 'www.youtube.com/iframe_api';
+
+        script.onerror = function(){
+            NFX_TR.api = 'failed';
+
+            console.log('NetflixUI', 'youtube api load failed');
+        };
+
+        document.head.appendChild(script);
+
+        var spent = 0;
+        var timer = setInterval(function(){
+            spent += 200;
+
+            if(NFX_TR.api === 'ready'){
+                clearInterval(timer);
+
+                return oncomplite(true);
+            }
+
+            if(spent > 8000 || NFX_TR.api === 'failed'){
+                clearInterval(timer);
+
+                NFX_TR.api = 'failed';
+
+                oncomplite(false);
+            }
+        }, 200);
+    }
+
+    /**
+     * Найти видео трейлера. Кешируется в памяти, запрос кеширует Lampa на неделю.
+     * @param {object} card
+     * @param {function} oncomplite вызывается с videoId или ''
+     */
+    function trailerVideo(card, oncomplite){
+        if(!card || !card.id) return oncomplite('');
+
+        var key = (isSerial(card) ? 'tv' : 'mv') + ':' + card.id;
+
+        if(typeof nfx_vid_cache[key] !== 'undefined') return oncomplite(nfx_vid_cache[key]);
+
+        var method = isSerial(card) ? 'tv' : 'movie';
+        var lang   = Lampa.Storage.field('tmdb_lang') || 'ru';
+
+        Lampa.Api.sources.tmdb.videos({ method: method, id: card.id }, function(json){
+            var list = ((json && json.results) || []).filter(function(video){
+                return video.site === 'YouTube' && video.key;
+            });
+
+            var pick = first(list, function(v){ return v.type === 'Trailer' && v.iso_639_1 === lang; })
+                    || first(list, function(v){ return v.type === 'Trailer'; })
+                    || first(list, function(v){ return v.type === 'Teaser'; })
+                    || list[0];
+
+            nfx_vid_cache[key] = pick ? pick.key : '';
+
+            oncomplite(nfx_vid_cache[key]);
+        }, function(){
+            nfx_vid_cache[key] = '';
+
+            oncomplite('');
+        });
+    }
+
+    /** Первый элемент по условию */
+    function first(list, check){
+        for(var i = 0; i < list.length; i++){
+            if(check(list[i])) return list[i];
+        }
+
+        return null;
+    }
+
+    /**
+     * Заранее узнать ключ трейлера — вызывается при фокусе, чтобы к концу
+     * выдержки ключ уже был.
+     * @param {object} card
+     */
+    function trailerPrepare(card){
+        if(!trailerDelay() || NFX_TR.api === 'failed') return;
+
+        trailerVideo(card, function(){});
+    }
+
+    /**
+     * Запросить трейлер для карточки. Любой новый запрос гасит предыдущий,
+     * поэтому переключение карточек само останавливает воспроизведение.
+     * @param {object} data карточка
+     * @param {jQuery} html элемент карточки
+     */
+    function trailerRequest(data, html){
+        trailerStop();
+
+        if(!trailerDelay() || !data || !html || !html.length) return;
+        if(NFX_TR.api === 'failed') return;
+
+        NFX_TR.timer = setTimeout(function(){
+            // За время выдержки фокус мог уйти
+            if(!html.hasClass('focus') && !html.hasClass('hover')) return;
+
+            trailerVideo(data, function(video){
+                if(!video) return;
+                if(!html.hasClass('focus') && !html.hasClass('hover')) return;
+
+                trailerApi(function(ok){
+                    if(!ok) return;
+                    if(!html.hasClass('focus') && !html.hasClass('hover')) return;
+
+                    trailerPlay(video, html);
+                });
+            });
+        }, trailerDelay());
+    }
+
+    /**
+     * Создать плеер и запустить.
+     * @param {string} video id видео на YouTube
+     * @param {jQuery} html элемент карточки
+     */
+    function trailerPlay(video, html){
+        var view = html.find('.nfx-card__view');
+
+        if(!view.length) return;
+
+        var host = $('<div class="nfx-card__trailer"><div></div></div>');
+
+        view.append(host);
+
+        NFX_TR.host = host;
+        NFX_TR.card = html;
+
+        try {
+            NFX_TR.player = new YT.Player(host.find('div')[0], {
+                videoId: video,
+                width: '100%',
+                height: '100%',
+                playerVars: {
+                    autoplay: 1,
+                    controls: 0,
+                    mute: 1,
+                    rel: 0,
+                    modestbranding: 1,
+                    playsinline: 1,
+                    disablekb: 1,
+                    fs: 0,
+                    iv_load_policy: 3,
+                    cc_load_policy: 0,
+                    cc_lang_pref: 'none'
+                },
+                events: {
+                    onReady: function(e){
+                        trailerNoCaptions(e.target);
+
+                        e.target.mute();
+                        e.target.playVideo();
+                    },
+                    onStateChange: function(e){
+                        // 1 — играет, 0 — закончился
+                        if(e.data === 1){
+                            trailerNoCaptions(e.target);
+
+                            if(NFX_TR.host) NFX_TR.host.addClass('nfx-card__trailer--on');
+                            if(NFX_TR.card) NFX_TR.card.addClass('nfx-card--trailer');
+
+                            trailerWatch();
+                            trailerUnmute();
+                        }
+
+                        if(e.data === 0) trailerStop();
+                    },
+                    onError: function(){
+                        trailerStop();
+                    }
+                }
+            });
+        }
+        catch(e){
+            console.log('NetflixUI', 'trailer error:', e.message);
+
+            return trailerStop();
+        }
+
+        // Плеер не поднялся за 6 секунд — считаем путь недоступным на этом устройстве
+        NFX_TR.guard = setTimeout(function(){
+            var state = -1;
+
+            try { state = NFX_TR.player.getPlayerState(); }
+            catch(err){}
+
+            if(state !== 1){
+                NFX_TR.api = 'failed';
+
+                console.log('NetflixUI', 'trailer unavailable, disabled for session');
+
+                trailerStop();
+            }
+        }, 6000);
+    }
+
+    /**
+     * Снять субтитры: cc_load_policy автосубтитры не всегда отключает.
+     * @param {object} player
+     */
+    function trailerNoCaptions(player){
+        try { player.unloadModule('captions'); } catch(e){}
+        try { player.unloadModule('cc'); } catch(e){}
+
+        try {
+            player.setOption('captions', 'track', {});
+        }
+        catch(e){}
+    }
+
+    /**
+     * Включить звук: стартуем всегда в тишине (беззвучный автозапуск разрешён
+     * всегда), затем плавно поднимаем громкость и перепроверяем, что браузер
+     * не запретил. Худший случай — трейлер без звука.
+     */
+    function trailerUnmute(){
+        if(!trailerSound() || !NFX_TR.player) return;
+
+        // Без пользовательского жеста в документе автозапуск со звуком запрещён
+        if(navigator.userActivation && !navigator.userActivation.hasBeenActive) return;
+
+        var player = NFX_TR.player;
+        var step   = 0;
+
+        clearInterval(NFX_TR.ramp);
+
+        try {
+            player.setVolume(0);
+            player.unMute();
+        }
+        catch(e){ return; }
+
+        NFX_TR.ramp = setInterval(function(){
+            if(NFX_TR.player !== player) return clearInterval(NFX_TR.ramp);
+
+            step += 10;
+
+            try {
+                // Браузер отклонил снятие звука — остаёмся в тишине
+                if(player.isMuted() || player.getPlayerState() !== 1){
+                    clearInterval(NFX_TR.ramp);
+
+                    player.mute();
+
+                    return;
+                }
+
+                player.setVolume(Math.min(60, step));
+            }
+            catch(e){
+                clearInterval(NFX_TR.ramp);
+            }
+
+            if(step >= 60) clearInterval(NFX_TR.ramp);
+        }, 120);
+    }
+
+    /** Не давать скринсейверу погасить экран во время трейлера */
+    function trailerWatch(){
+        clearInterval(NFX_TR.tick);
+
+        NFX_TR.tick = setInterval(function(){
+            if(!NFX_TR.player) return clearInterval(NFX_TR.tick);
+
+            try { Lampa.Screensaver.resetTimer(); }
+            catch(e){}
+        }, 2000);
+    }
+
+    /**
+     * Состояние трейлера для отладки (в том числе на телевизорах, где консоль
+     * недоступна): window.nfx_trailer_state()
+     * @return {object}
+     */
+    function trailerState(){
+        var state = {
+            api: NFX_TR.api,
+            playing: false,
+            muted: null,
+            volume: null,
+            time: null,
+            delay: trailerDelay(),
+            sound: trailerSound()
+        };
+
+        if(NFX_TR.player){
+            try {
+                state.playing = NFX_TR.player.getPlayerState() === 1;
+                state.muted   = NFX_TR.player.isMuted();
+                state.volume  = NFX_TR.player.getVolume();
+                state.time    = Math.round(NFX_TR.player.getCurrentTime() * 10) / 10;
+            }
+            catch(e){
+                state.error = e.message;
+            }
+        }
+
+        return state;
+    }
+
+    /** Погасить трейлер и вернуть кадр */
+    function trailerStop(){
+        clearTimeout(NFX_TR.timer);
+        clearTimeout(NFX_TR.guard);
+        clearInterval(NFX_TR.tick);
+        clearInterval(NFX_TR.ramp);
+
+        NFX_TR.timer = null;
+        NFX_TR.guard = null;
+
+        if(NFX_TR.player){
+            try { NFX_TR.player.mute(); } catch(e){}
+            try { NFX_TR.player.stopVideo(); } catch(e){}
+            try { NFX_TR.player.destroy(); } catch(e){}
+
+            NFX_TR.player = null;
+        }
+
+        if(NFX_TR.card){
+            NFX_TR.card.removeClass('nfx-card--trailer');
+            NFX_TR.card = null;
+        }
+
+        if(NFX_TR.host){
+            NFX_TR.host.remove();
+            NFX_TR.host = null;
+        }
+    }
+
+    /* ---------- src/card.js ---------- */
+    /**
+     * Карточка.
+     * @param {object} data  карточка TMDB/Lampac
+     * @param {object} params {shape:'expand'|'wide'|'poster'|'top', rank:number, titles:boolean}
+     */
+    function NfxCard(data, params){
+        var _self = this;
+
+        this.data   = data || {};
+        this.params = params || {};
+
+        var shape   = this.params.shape || 'expand';
+        var expand  = shape === 'expand';
+        var wide    = shape === 'wide';
+
+        var img_el      = null;
+        var img_wide_el = null;
+        var logo_el     = null;
+        var wide_loaded = false;
+        var art_done    = false;
+        var art_timer   = null;
+
+        /** Собрать DOM */
+        this.create = function(){
+            var title    = cardTitle(this.data);
+            var year     = cardYear(this.data);
+            var match    = matchPercent(this.data);
+            var progress = this.data.nfx_progress || 0;
+
+            var html = '<div class="nfx-card selector layer--visible">';
+
+            if(shape === 'top' && this.params.rank){
+                html += '<div class="nfx-card__rank"><span>' + this.params.rank + '</span></div>';
+                html += '<div class="nfx-card__box">';
+            }
+
+            html += '<div class="nfx-card__view">';
+            html += '<img class="nfx-card__img" alt="" />';
+
+            // В режиме expand фокусная карточка превращается в широкую плитку 16:9,
+            // поэтому нужен второй кадр — постер под 2:3 в него не растянуть.
+            if(expand){
+                html += '<img class="nfx-card__img-wide" alt="" />';
+                html += '<div class="nfx-card__shade"></div>';
+                html += '<div class="nfx-card__promo">';
+                html += '<div class="nfx-card__kind"><span>' + esc(isSerial(this.data) ? tr('nfx_series') : tr('nfx_movie')) + '</span></div>';
+                html += '<div class="nfx-card__titlebox">';
+                html += '<img class="nfx-card__logo" alt="" />';
+                html += '<div class="nfx-card__name' + nameSize(title) + '">' + esc(title) + '</div>';
+                html += '</div>';
+                html += '</div>';
+            }
+            else {
+                html += '<div class="nfx-card__grad"></div>';
+                html += '<div class="nfx-card__label">' + esc(title) + (year ? ' <span style="opacity:.7">' + year + '</span>' : '') + '</div>';
+            }
+
+            if(shouldBadge()){
+                if(isNew(this.data)) html += '<div class="nfx-card__badge">NEW</div>';
+                else if(match && progress <= 1) html += '<div class="nfx-card__vote">' + match + '%</div>';
+            }
+
+            if(progress > 1) html += '<div class="nfx-card__progress"><div style="width:' + Math.min(100, progress) + '%"></div></div>';
+
+            html += '</div>';
+
+            if(shape === 'top' && this.params.rank) html += '</div>';
+
+            if(this.params.titles && shape !== 'top' && !expand){
+                html += '<div class="nfx-card__title">' + esc(title) + '</div>';
+            }
+
+            html += '</div>';
+
+            this.html = $(html);
+
+            this.html[0].card_data = this.data;
+
+            img_el      = this.html.find('.nfx-card__img')[0];
+            img_wide_el = expand ? this.html.find('.nfx-card__img-wide')[0] : null;
+            logo_el     = expand ? this.html.find('.nfx-card__logo') : null;
+
+            this.loadImage();
+            this.bind();
+
+            return this;
+        };
+
+        /** Бейджи NEW / рейтинг: в expand только на раскрытой плитке */
+        function shouldBadge(){
+            return !expand;
+        }
+
+        /** Основной кадр с фолбэком на другую ориентацию */
+        this.loadImage = function(){
+            if(!img_el) return;
+
+            var tries = 0;
+            var srcs  = [];
+
+            // expand и top показывают постер 2:3, wide — кадр 16:9
+            var primary   = cardImage(this.data, wide);
+            var secondary = cardImage(this.data, !wide);
+
+            if(primary) srcs.push(primary);
+            if(secondary && secondary !== primary) srcs.push(secondary);
+
+            if(!srcs.length){
+                img_el.style.display = 'none';
+                return;
+            }
+
+            var is_fallback = wide && !this.data.backdrop_path;
+
+            img_el.onload = function(){
+                $(img_el).addClass('nfx-card__img--loaded');
+
+                if(is_fallback) $(img_el).addClass('nfx-card__img--fallback');
+            };
+
+            img_el.onerror = function(){
+                tries++;
+
+                if(tries < srcs.length) img_el.src = srcs[tries];
+                else img_el.style.display = 'none';
+            };
+
+            img_el.src = srcs[0];
+        };
+
+        /**
+         * Раскрытие карточки: широкий кадр 16:9 и логотип названия.
+         * @param {string} source 'focus' — пульт, 'hover' — мышь или тач
+         */
+        this.expand = function(source){
+            if(!expand) return;
+
+            // Мышью раскрываем оверлеем: полка не перекладывается, контент
+            // не уезжает из-под курсора и не возникает петли mouseenter
+            this.html.toggleClass('nfx-card--over', source === 'hover');
+
+            // Кадр из списка есть — ставим сразу, не дожидаясь /images
+            if(!wide_loaded && img_wide_el && this.data.backdrop_path){
+                wide_loaded = true;
+
+                this.setWide(img(this.data.backdrop_path, 'w780'));
+            }
+
+            // Ключ трейлера узнаём сразу, чтобы к концу выдержки он уже был,
+            // а сам запуск — по таймеру внутри trailerRequest
+            trailerPrepare(this.data);
+            trailerRequest(this.data, this.html);
+
+            if(art_done) return;
+
+            // Префетч обычно уже положил арт в память — тогда без задержки
+            var cached = artCached(this.data);
+
+            if(cached){
+                art_done = true;
+
+                return this.applyArt(cached);
+            }
+
+            clearTimeout(art_timer);
+
+            art_timer = setTimeout(function(){
+                if(!_self.html || !_self.focused() || art_done) return;
+
+                art_done = true;
+
+                artwork(_self.data, function(art){
+                    if(_self.html) _self.applyArt(art);
+                });
+            }, 220);
+        };
+
+        /**
+         * Применить полученный арт.
+         * @param {object} art {logo, backdrop}
+         */
+        this.applyArt = function(art){
+            if(!this.html) return;
+
+            if(art.logo && logo_el && logo_el.length){
+                var node = logo_el[0];
+
+                node.onload = function(){
+                    if(!_self.html) return;
+
+                    logo_el.addClass('nfx-card__logo--on');
+                    _self.html.find('.nfx-card__name').addClass('nfx-card__name--off');
+                };
+
+                node.src = art.logo;
+            }
+
+            // backdrop_path бывает пустым в списках, хотя кадры существуют
+            if(!wide_loaded && art.backdrop){
+                wide_loaded = true;
+
+                return this.setWide(art.backdrop);
+            }
+
+            // Кадра 16:9 нет вовсе — не растягиваем постер, а собираем плитку:
+            // постер слева, название справа на градиенте
+            if(!wide_loaded) this.html.addClass('nfx-card--noart');
+        };
+
+        /**
+         * Поставить широкий кадр.
+         * Пока кадр не загружен, плитка показывает постер в своих пропорциях
+         * слева на градиенте — так не видно растянутого постера, и подмена
+         * выглядит как переход, а не как загрузка.
+         * @param {string} src
+         */
+        this.setWide = function(src){
+            if(!src || !img_wide_el) return;
+
+            var ready = function(){
+                if(!_self.html) return;
+
+                $(img_wide_el).addClass('nfx-card__img--loaded');
+                _self.html.removeClass('nfx-card--pending');
+            };
+
+            img_wide_el.onload = ready;
+
+            img_wide_el.onerror = function(){
+                // Кадр не открылся — остаёмся на составной плитке
+                if(!_self.html) return;
+
+                _self.html.removeClass('nfx-card--pending');
+                _self.html.addClass('nfx-card--noart');
+            };
+
+            img_wide_el.src = src;
+
+            // Кадр уже в кеше браузера (сработал прогрев) — показываем сразу,
+            // иначе на один кадр мигнула бы составная раскладка
+            if(img_wide_el.complete && img_wide_el.naturalWidth) ready();
+            else this.html.addClass('nfx-card--pending');
+        };
+
+        /** Карточка сейчас раскрыта (пульт или мышь) */
+        this.focused = function(){
+            return !!this.html && (this.html.hasClass('focus') || this.html.hasClass('hover'));
+        };
+
+        /** Навигация и события */
+        this.bind = function(){
+            // hover:focus — пульт и клавиатура, hover:hover — мышь, hover:touch — тач.
+            // Класс .focus Lampa вешает во всех трёх случаях, поэтому раскрывать
+            // карточку и обновлять метаданные надо тоже во всех трёх.
+            this.html.on('hover:focus', function(){
+                _self.expand('focus');
+
+                if(_self.onFocus) _self.onFocus(_self.data, _self, 'focus');
+            });
+
+            this.html.on('hover:hover hover:touch', function(){
+                _self.expand('hover');
+
+                if(_self.onFocus) _self.onFocus(_self.data, _self, 'hover');
+            });
+
+            this.html.on('hover:enter', function(){
+                if(_self.onEnter) _self.onEnter(_self.data, _self);
+            });
+
+            this.html.on('hover:long', function(){
+                if(_self.onLong) _self.onLong(_self.data, _self);
+            });
+        };
+
+        /**
+         * @param {boolean} js вернуть DOM-элемент
+         * @return {jQuery|HTMLElement}
+         */
+        this.render = function(js){
+            return js ? this.html[0] : this.html;
+        };
+
+        this.destroy = function(){
+            clearTimeout(art_timer);
+
+            if(NFX_TR.card && this.html && NFX_TR.card[0] === this.html[0]) trailerStop();
+
+            [img_el, img_wide_el].forEach(function(el){
+                if(!el) return;
+
+                el.onload = null;
+                el.onerror = null;
+                el.src = '';
+            });
+
+            if(this.html) this.html.remove();
+
+            img_el      = null;
+            img_wide_el = null;
+            logo_el     = null;
+            this.html   = null;
+            this.data   = null;
+        };
+    }
+
+    /**
+     * Класс кегля для текстового названия: длинные названия должны читаться
+     * как надпись на плакате, а не как абзац.
+     * @param {string} title
+     * @return {string}
+     */
+    function nameSize(title){
+        var length = ('' + title).length;
+
+        if(length > 34) return ' nfx-card__name--xlong';
+        if(length > 18) return ' nfx-card__name--long';
+
+        return '';
+    }
+
+    /**
+     * Свежий релиз (< 45 дней) — бейдж NEW как на Netflix.
+     * @param {object} card
+     * @return {boolean}
+     */
+    function isNew(card){
+        var date = card.release_date || card.first_air_date;
+
+        if(!date) return false;
+
+        var time = Date.parse(('' + date).replace(/-/g, '/'));
+
+        if(isNaN(time)) return false;
+
+        var days = (Date.now() - time) / 86400000;
+
+        return days >= 0 && days < 45;
+    }
+
+    /* ---------- src/row.js ---------- */
+    /**
+     * Горизонтальная полка.
+     * @param {object} data   {title, results, url, source, nfx_shape, nfx_rank, nfx_meta, nfx_activity}
+     * @param {object} params {titles:boolean}
+     */
+    function NfxRow(data, params){
+        var _self = this;
+
+        this.data   = data || {};
+        this.params = params || {};
+
+        var shape   = this.data.nfx_shape || 'expand';
+        var expand  = shape === 'expand';
+        var ranked  = !!this.data.nfx_rank;
+        var meta_on = expand || !!this.data.nfx_meta;
+        var tv      = Lampa.Platform.screen('tv');
+        var view    = tv ? 7 : 12;
+        var items   = [];
+        var built   = 0;
+        var active  = 0;
+        var last    = false;
+        var scroll  = new Lampa.Scroll({ horizontal: true, step: expand ? 500 : (shape === 'wide' ? 420 : 300) });
+        var more_el = null;
+        var meta_el = null;
+        var meta_id = 0;
+        var pos_timer = null;
+
+        /** Собрать DOM полки */
+        this.create = function(){
+            var html = '<div class="nfx-row nfx-row--' + shape + ' layer--visible">' +
+                       '<div class="nfx-row__head">' +
+                            '<div class="nfx-row__title">' + esc(this.data.title || '') + '</div>' +
+                            '<div class="nfx-row__more">' + esc(tr('nfx_more')) + ' ›</div>' +
+                       '</div>' +
+                       '<div class="nfx-row__body"></div>' +
+                       (meta_on ? '<div class="nfx-row__meta"><div class="nfx-row__meta-1"></div><div class="nfx-row__meta-2"></div></div>' : '') +
+                       '</div>';
+
+            this.html = $(html);
+
+            more_el = this.html.find('.nfx-row__more');
+            meta_el = meta_on ? this.html.find('.nfx-row__meta') : null;
+
+            // Заголовок «Все ›» — только для мыши; на ТВ переход делается плиткой в конце полки
+            more_el.on('click', function(){
+                _self.more();
+            });
+
+            scroll.body(true).addClass('nfx-row__cards');
+            scroll.onScroll = this.append.bind(this);
+            scroll.onWheel  = this.wheel.bind(this);
+
+            this.html.find('.nfx-row__body').append(scroll.render(true));
+
+            this.html.on('visible', function(){
+                Lampa.Layer.visible(scroll.render(true));
+            });
+
+            this.append();
+
+            // Первые карточки полки готовим сразу — до первого наведения
+            if(expand) artPrefetch((this.data.results || []).slice(0, 3));
+
+            return this;
+        };
+
+        /** Догрузить карточки в скролл */
+        this.append = function(){
+            var results = this.data.results || [];
+            var need    = tv ? (Math.round(active / view) + 1) * view + 1 : results.length;
+
+            need = Math.min(need, results.length);
+
+            if(built === 0) need = Math.min(Math.max(need, view), results.length);
+
+            while(built < need){
+                this.push(results[built], built);
+                built++;
+            }
+
+            if(built >= results.length) this.pushMoreTile();
+
+            Lampa.Layer.visible(scroll.render(true));
+        };
+
+        /**
+         * Добавить одну карточку.
+         * @param {object} element
+         * @param {number} index
+         */
+        this.push = function(element, index){
+            if(!element) return;
+
+            var card = new NfxCard(element, {
+                shape: shape,
+                rank: ranked ? index + 1 : 0,
+                titles: this.params.titles
+            });
+
+            card.create();
+
+            card.onFocus = function(card_data, item, source){
+                var prev = active;
+
+                last   = card.render(true);
+                active = indexOfItem(card);
+
+                // Заранее тянем арт соседей, чтобы наведение было без задержки
+                _self.prefetchAround(active);
+
+                // При наведении мышью полку не двигаем — иначе контент уезжает
+                // из-под курсора. Пультом — подтягиваем как на Netflix.
+                if(source !== 'hover'){
+                    if(expand && pinLeft()) _self.align(card.render(true));
+                    else if(active > 0 || prev > active) scroll.update(card.render(true), true);
+                }
+
+                _self.setMeta(card_data);
+
+                if(_self.onFocus) _self.onFocus(card_data);
+            };
+
+            card.onEnter = function(card_data){
+                if(_self.onEnter) _self.onEnter(card_data);
+            };
+
+            card.onLong = function(card_data){
+                if(_self.onLong) _self.onLong(card_data);
+            };
+
+            var render = card.render(true);
+
+            // Догруженные карточки нужно добавить в коллекцию навигации,
+            // иначе фокус не сможет уехать дальше уже отрисованных
+            $(render).on('visible', function(){
+                if(Lampa.Controller.own(_self)) Lampa.Controller.collectionAppend(render);
+            });
+
+            scroll.append(render);
+
+            items.push(card);
+
+            if(Lampa.Controller.own(this)) Lampa.Controller.collectionAppend(render);
+        };
+
+        /**
+         * Фоновая подгрузка арта вокруг индекса.
+         * @param {number} index
+         */
+        this.prefetchAround = function(index){
+            if(!expand) return;
+
+            var results = this.data.results || [];
+
+            artPrefetch(results.slice(Math.max(0, index - 1), index + 5));
+
+            // Кадр 16:9 тяжёлый, поэтому прогреваем узкое окно — вперёд по ходу листания
+            artWarmBackdrops(results.slice(Math.max(0, index - 1), index + 3));
+        };
+
+        /**
+         * Подтянуть раскрытую карточку к левому краю полки.
+         * Lampa бросает hover:focus ДО установки класса .focus, поэтому в момент
+         * события ширины ещё старые — считаем позицию на следующем тике.
+         * @param {HTMLElement} element
+         */
+        this.align = function(element){
+            clearTimeout(pos_timer);
+
+            pos_timer = setTimeout(function(){
+                if(!_self.html || !element) return;
+
+                // Фокус мог уже уехать дальше — тогда позицию посчитает следующий вызов
+                if(!$(element).hasClass('focus')) return;
+
+                scroll.update(element, false);
+            }, 0);
+        };
+
+        /**
+         * Обновить строки метаданных под полкой.
+         * @param {object} card_data
+         */
+        this.setMeta = function(card_data){
+            if(!meta_el || !card_data) return;
+
+            var id = ++meta_id;
+
+            var meta = watchMeta(card_data, function(update){
+                // Ответ мог прийти, когда фокус уже уехал на другую карточку
+                if(id !== meta_id || !meta_el) return;
+
+                meta_el.find('.nfx-row__meta-1').text(update.line1);
+                meta_el.find('.nfx-row__meta-2').text(update.line2);
+            });
+
+            meta_el.find('.nfx-row__meta-1').text(meta.line1);
+            meta_el.find('.nfx-row__meta-2').text(meta.line2);
+        };
+
+        /** Плитка «показать все» в конце полки */
+        this.pushMoreTile = function(){
+            if(more_el === null || this.tile_added) return;
+            if(!this.data.url && !this.data.nfx_activity) return;
+
+            this.tile_added = true;
+
+            var tile = $('<div class="nfx-card nfx-card--more selector">' +
+                            '<div class="nfx-card__view">' +
+                                '<div class="nfx-card__more-ico">›</div>' +
+                            '</div>' +
+                         '</div>');
+
+            tile.on('hover:enter', function(){
+                _self.more();
+            });
+
+            var tileMeta = function(){
+                last = tile[0];
+
+                if(meta_el){
+                    meta_el.find('.nfx-row__meta-1').text(_self.data.title || '');
+                    meta_el.find('.nfx-row__meta-2').text(tr('nfx_more_all'));
+                }
+            };
+
+            tile.on('hover:focus', function(){
+                tileMeta();
+
+                if(expand && pinLeft()) _self.align(tile[0]);
+                else scroll.update(tile[0], true);
+            });
+
+            tile.on('hover:hover hover:touch', tileMeta);
+
+            scroll.append(tile);
+
+            if(Lampa.Controller.own(this)) Lampa.Controller.collectionAppend(tile[0]);
+        };
+
+        /** Переход в полный список */
+        this.more = function(){
+            var data = this.data;
+
+            if(data.nfx_activity){
+                var push = {};
+
+                for(var key in data.nfx_activity) push[key] = data.nfx_activity[key];
+
+                push.page = 1;
+
+                return Lampa.Activity.push(push);
+            }
+
+            if(!data.url) return;
+
+            Lampa.Activity.push({
+                url: data.url,
+                title: data.title,
+                component: 'category_full',
+                source: data.source || 'tmdb',
+                page: 1
+            });
+        };
+
+        /** Прокрутка колесом мыши */
+        this.wheel = function(step){
+            if(!Lampa.Controller.own(this)) this.toggle();
+
+            var controller = Lampa.Controller.enabled().controller;
+
+            if(controller) controller[step > 0 ? 'right' : 'left']();
+        };
+
+        /** Забрать фокус на себя */
+        this.toggle = function(){
+            this.html.addClass('nfx-row--active');
+
+            this.prefetchAround(active);
+
+            Lampa.Controller.add('nfx_row', {
+                link: this,
+                toggle: function(){
+                    Lampa.Controller.collectionSet(scroll.render(true));
+                    Lampa.Controller.collectionFocus(last || false, scroll.render(true));
+                },
+                right: function(){
+                    if(Navigator.canmove('right')) Navigator.move('right');
+                },
+                left: function(){
+                    if(Navigator.canmove('left')) Navigator.move('left');
+                    else if(_self.onLeft) _self.onLeft();
+                },
+                up: function(){
+                    if(_self.onUp) _self.onUp();
+                },
+                down: function(){
+                    if(_self.onDown) _self.onDown();
+                },
+                back: function(){
+                    if(_self.onBack) _self.onBack();
+                }
+            });
+
+            Lampa.Controller.toggle('nfx_row');
+        };
+
+        /** Снять подсветку заголовка */
+        this.blur = function(){
+            if(this.html) this.html.removeClass('nfx-row--active');
+        };
+
+        this.render = function(js){
+            return js ? this.html[0] : this.html;
+        };
+
+        this.destroy = function(){
+            meta_id++;
+
+            trailerStop();
+
+            clearTimeout(pos_timer);
+
+            for(var i = 0; i < items.length; i++) items[i].destroy();
+
+            items = [];
+
+            scroll.destroy();
+
+            if(this.html) this.html.remove();
+
+            this.html = null;
+            this.data = null;
+            meta_el   = null;
+        };
+
+        /** Индекс карточки в полке */
+        function indexOfItem(card){
+            for(var i = 0; i < items.length; i++){
+                if(items[i] === card) return i;
+            }
+
+            return 0;
+        }
+    }
+
+    /** Прижимать активную карточку к левому краю (сквозное листание) */
+    function pinLeft(){
+        var value = pref('nfx_pin');
+
+        return value === true || value === 'true';
+    }
+
+    /* ---------- src/billboard.js ---------- */
+    /**
+     * Промо-баннер (billboard) как на главной Netflix.
+     * @param {object} params {titles:boolean}
+     */
+    function NfxBillboard(params){
+        var _self = this;
+
+        this.params = params || {};
+
+        var cards    = [];
+        var index    = 0;
+        var swap     = false;
+        var timer    = null;
+        var logo_req = 0;
+
+        var ICON_PLAY = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M5 3.5v17l14-8.5z"/></svg>';
+        var ICON_INFO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.6v.6" stroke-linecap="round"/></svg>';
+
+        /** Собрать DOM */
+        this.create = function(){
+            var html = '<div class="nfx-bb layer--visible">' +
+                '<div class="nfx-bb__art"></div>' +
+                '<div class="nfx-bb__art-next"></div>' +
+                '<div class="nfx-bb__scrim"></div>' +
+                '<div class="nfx-bb__scrim-b"></div>' +
+                '<div class="nfx-bb__dots"></div>' +
+                '<div class="nfx-bb__info">' +
+                    '<div class="nfx-bb__brand"><span class="nfx-bb__kind"></span></div>' +
+                    '<img class="nfx-bb__logo" style="display:none" alt="" />' +
+                    '<div class="nfx-bb__title"></div>' +
+                    '<div class="nfx-bb__meta"></div>' +
+                    '<div class="nfx-bb__descr"></div>' +
+                    '<div class="nfx-bb__buttons">' +
+                        '<div class="nfx-btn nfx-btn--play selector">' + ICON_PLAY + '<span>' + esc(tr('nfx_play')) + '</span></div>' +
+                        '<div class="nfx-btn nfx-btn--info selector">' + ICON_INFO + '<span>' + esc(tr('nfx_info')) + '</span></div>' +
+                    '</div>' +
+                '</div>' +
+            '</div>';
+
+            this.html = $(html);
+
+            this.html.find('.nfx-btn--play').on('hover:enter', function(){ _self.play(); });
+            this.html.find('.nfx-btn--info').on('hover:enter', function(){ _self.info(); });
+
+            // Любое касание баннера откладывает автосмену на полный интервал,
+            // чтобы карточка не подменилась под нажатием «Смотреть»
+            this.html.find('.nfx-btn').on('hover:focus hover:hover hover:touch', function(){
+                _self.rotate();
+            });
+
+            return this;
+        };
+
+        /**
+         * Задать карточки для ротации.
+         * @param {array} list
+         */
+        this.setCards = function(list){
+            cards = list || [];
+
+            if(!cards.length){
+                this.html.addClass('nfx-bb--noart');
+                this.html.find('.nfx-bb__descr').text('');
+                return;
+            }
+
+            this.dots();
+            this.show(0, true);
+            this.rotate();
+        };
+
+        /** Индикаторы-точки */
+        this.dots = function(){
+            var box = this.html.find('.nfx-bb__dots').empty();
+
+            if(cards.length < 2) return;
+
+            for(var i = 0; i < cards.length; i++){
+                box.append('<div class="nfx-bb__dot' + (i === 0 ? ' nfx-bb__dot--on' : '') + '"></div>');
+            }
+        };
+
+        /**
+         * Показать карточку.
+         * @param {number} i
+         * @param {boolean} immediately без плавного перехода
+         */
+        this.show = function(i, immediately){
+            if(!cards.length) return;
+
+            index = (i + cards.length) % cards.length;
+
+            var card = cards[index];
+            var art  = heroImage(card);
+
+            // Крестфейд между двумя слоями
+            var target = swap ? '.nfx-bb__art' : '.nfx-bb__art-next';
+
+            this.html.find(target).css('background-image', art ? 'url("' + art + '")' : 'none');
+
+            if(immediately){
+                this.html.find('.nfx-bb__art').css('background-image', art ? 'url("' + art + '")' : 'none');
+                this.html.removeClass('nfx-bb--swap');
+                swap = false;
+            }
+            else {
+                swap = !swap;
+                this.html.toggleClass('nfx-bb--swap', swap);
+            }
+
+            this.fill(card);
+
+            this.html.find('.nfx-bb__dot').each(function(n){
+                $(this).toggleClass('nfx-bb__dot--on', n === index);
+            });
+        };
+
+        /**
+         * Заполнить текстовый блок.
+         * @param {object} card
+         */
+        this.fill = function(card){
+            var serial = isSerial(card);
+            var match  = matchPercent(card);
+            var year   = cardYear(card);
+            var age    = ageLimit(card);
+            var genres = genreNames(card);
+
+            this.html.find('.nfx-bb__kind').text(serial ? tr('nfx_series') : tr('nfx_movie'));
+            this.html.find('.nfx-bb__title').text(cardTitle(card));
+            this.html.find('.nfx-bb__descr').text(cut(card.overview, 260));
+
+            var meta = '';
+
+            if(match) meta += '<span class="nfx-bb__match">' + match + '% ' + esc(tr('nfx_match')) + '</span>';
+            if(year)  meta += '<span>' + year + '</span>';
+            meta += '<span class="nfx-bb__age">' + age + '</span>';
+            if(genres) meta += '<span>' + esc(genres) + '</span>';
+
+            this.html.find('.nfx-bb__meta').html(meta);
+
+            // Логотип-надпись подгружаем асинхронно
+            var logo  = this.html.find('.nfx-bb__logo');
+            var title = this.html.find('.nfx-bb__title');
+            var req   = ++logo_req;
+
+            logo.hide();
+            title.show();
+
+            titleLogo(card, function(src){
+                if(req !== logo_req || !_self.html) return;
+
+                if(src){
+                    logo.attr('src', src).show();
+                    title.hide();
+                }
+            });
+        };
+
+        /** Автосмена баннера */
+        this.rotate = function(){
+            this.stop();
+
+            var seconds = parseInt(pref('nfx_rotate'), 10);
+
+            if(!seconds || cards.length < 2) return;
+
+            timer = setInterval(function(){
+                if(!_self.html) return _self.stop();
+
+                _self.show(index + 1);
+            }, seconds * 1000);
+        };
+
+        this.stop = function(){
+            if(timer) clearInterval(timer);
+
+            timer = null;
+        };
+
+        /** Текущая карточка */
+        this.card = function(){
+            return cards.length ? cards[index] : null;
+        };
+
+        /** «Смотреть» */
+        this.play = function(){
+            var card = this.card();
+
+            if(!card) return;
+
+            nfxAutoPlay(card);
+        };
+
+        /** «Подробнее» */
+        this.info = function(){
+            var card = this.card();
+
+            if(!card) return;
+
+            openCard(card);
+        };
+
+        /** Забрать фокус на кнопки баннера */
+        this.toggle = function(){
+            var buttons = this.html.find('.nfx-bb__buttons')[0];
+
+            Lampa.Controller.add('nfx_billboard', {
+                link: this,
+                toggle: function(){
+                    Lampa.Controller.collectionSet(buttons);
+                    Lampa.Controller.collectionFocus(_self.html.find('.nfx-btn--play')[0], buttons);
+                },
+                right: function(){
+                    Navigator.move('right');
+                },
+                left: function(){
+                    if(Navigator.canmove('left')) Navigator.move('left');
+                    else if(_self.onLeft) _self.onLeft();
+                },
+                up: function(){
+                    if(_self.onUp) _self.onUp();
+                },
+                down: function(){
+                    if(_self.onDown) _self.onDown();
+                },
+                back: function(){
+                    if(_self.onBack) _self.onBack();
+                }
+            });
+
+            Lampa.Controller.toggle('nfx_billboard');
+        };
+
+        this.render = function(js){
+            return js ? this.html[0] : this.html;
+        };
+
+        this.destroy = function(){
+            this.stop();
+
+            if(this.html) this.html.remove();
+
+            this.html = null;
+            cards = [];
+        };
+    }
+
+    /**
+     * Открыть карточку и сразу нажать «Смотреть» — поведение Play на Netflix.
+     * @param {object} card
+     */
+    function nfxAutoPlay(card){
+        nfx_autoplay_wait = true;
+
+        openCard(card);
+    }
+
+    /** Флаг ожидания автозапуска */
+    var nfx_autoplay_wait = false;
+
+    /** Подписка на построение полной карточки для автозапуска */
+    function autoPlayInit(){
+        Lampa.Listener.follow('full', function(e){
+            if(!nfx_autoplay_wait) return;
+            if(e.type !== 'build' || e.name !== 'start') return;
+
+            nfx_autoplay_wait = false;
+
+            setTimeout(function(){
+                var button = e.body.find('.button--priority');
+
+                if(!button.length) button = e.body.find('.button--play');
+
+                if(button.length) button.trigger('hover:enter');
+            }, 400);
+        });
+
+        // Если карточка не открылась — снимаем флаг
+        Lampa.Listener.follow('activity', function(e){
+            if(e.type === 'start' && e.component !== 'full') nfx_autoplay_wait = false;
+        });
+    }
+
+    /* ---------- src/component.js ---------- */
+    /**
+     * Главная страница в стиле Netflix TV.
+     * Регистрируется как компонент 'nfx_main' (и подменяет 'main', если включено).
+     * @param {object} object параметры активности
+     */
+    function NfxMain(object){
+        var _self = this;
+
+        this.object = object || {};
+
+        var scroll    = new Lampa.Scroll({ over: true, end_ratio: 2 });
+        var nav       = null;
+        var billboard = null;
+        var rows      = [];
+        var sections  = [];
+        var active    = 0;
+        var parts     = [];
+        var next_wait = false;
+        var built     = false;
+        var tab       = this.object.nfx_tab || 'home';
+
+        // Растёт при смене вкладки: отсекает ответы запросов от прошлой вкладки
+        var token = 0;
+
+        /** Создание компонента */
+        this.create = function(){
+            this.activity.loader(true);
+
+            this.html = $('<div class="nfx"></div>');
+
+            scroll.height();
+            scroll.nopadding();
+
+            scroll.onEnd   = this.loadNext.bind(this);
+            scroll.onWheel = this.wheel.bind(this);
+
+            this.rows_box = $('<div class="nfx-rows"></div>');
+
+            if(navEnabled()){
+                nav = new NfxNav({ tab: tab });
+                nav.create();
+
+                nav.onSelect = function(key){ _self.setTab(key); };
+                nav.onDown   = function(){ Lampa.Controller.toggle('content'); };
+                nav.onBack   = function(){ _self.back(); };
+
+                this.html.append(nav.render(true));
+            }
+
+            this.buildBillboard();
+
+            scroll.append(this.rows_box);
+
+            this.html.append(scroll.render(true));
+
+            this.reload();
+        };
+
+        /** Баннер нужен не на всех вкладках: на «Моё» его нет, как в Netflix */
+        this.buildBillboard = function(){
+            var need = showBillboard() && tab !== 'my';
+
+            if(need && !billboard){
+                billboard = new NfxBillboard({});
+                billboard.create();
+
+                billboard.onDown = function(){ _self.down(); };
+                billboard.onUp   = function(){ _self.focusNav(); };
+                billboard.onLeft = function(){ Lampa.Controller.toggle('menu'); };
+                billboard.onBack = function(){ _self.back(); };
+
+                // Баннер всегда первым в скролле
+                scroll.body(true).insertBefore(billboard.render(true), scroll.body(true).firstChild);
+
+                billboardCards(function(list){
+                    if(!_self.html || !billboard) return;
+
+                    billboard.setCards(list);
+                });
+            }
+
+            if(!need && billboard){
+                billboard.destroy();
+                billboard = null;
+            }
+
+            this.html.toggleClass('nfx--no-hero', !billboard);
+        };
+
+        /**
+         * Переключить вкладку.
+         * @param {string} key
+         */
+        this.setTab = function(key){
+            if(key === tab) return;
+
+            tab   = key;
+            token++;
+
+            trailerStop();
+
+            this.object.nfx_tab = key;
+
+            apiClear();
+
+            for(var i = 0; i < rows.length; i++) rows[i].destroy();
+
+            rows      = [];
+            sections  = [];
+            active    = 0;
+            built     = false;
+            next_wait = false;
+
+            this.rows_box.empty();
+
+            this.buildBillboard();
+
+            scroll.reset();
+
+            this.activity.loader(true);
+
+            this.reload();
+        };
+
+        /** Собрать полки текущей вкладки */
+        this.reload = function(){
+            parts = buildParts(tab);
+
+            if(billboard) sections.push(billboard);
+
+            this.loadPart(this.build.bind(this), this.empty.bind(this));
+        };
+
+        /**
+         * Загрузить очередную порцию полок.
+         * @param {function} loaded
+         * @param {function} fail
+         */
+        this.loadPart = function(loaded, fail){
+            var mine = token;
+
+            partNext(parts, NFX.parts_limit, function(data){
+                if(mine !== token) return;
+
+                loaded(data);
+            }, function(){
+                if(mine !== token) return;
+
+                fail();
+            });
+        };
+
+        /**
+         * Отрисовать полученные полки.
+         * @param {array} data
+         */
+        this.build = function(data){
+            if(!this.html) return;
+
+            this.append(data);
+
+            built = true;
+
+            this.activity.loader(false);
+            this.activity.toggle();
+        };
+
+        /** Ничего не пришло */
+        this.empty = function(){
+            if(!this.html || built) return;
+
+            // На «Моё» все полки локальные: пусто — значит списки пустые, а не сбой сети
+            var personal = tab === 'my';
+
+            this.rows_box.append(
+                '<div class="nfx-empty">' +
+                    '<div class="nfx-empty__title">' + esc(tr(personal ? 'nfx_empty_my' : 'nfx_empty')) + '</div>' +
+                    '<div class="nfx-empty__hint">' + esc(tr(personal ? 'nfx_empty_my_hint' : 'nfx_empty_hint')) + '</div>' +
+                '</div>'
+            );
+
+            this.activity.loader(false);
+            this.activity.toggle();
+        };
+
+        /**
+         * Добавить полки в DOM.
+         * @param {array} data
+         */
+        this.append = function(data){
+            if(!data || !data.length || !this.html) return;
+
+            var fragment = document.createDocumentFragment();
+
+            for(var i = 0; i < data.length; i++){
+                var item = data[i];
+
+                if(!item || !item.results || !item.results.length) continue;
+
+                var row = new NfxRow(item, { titles: showTitles() });
+
+                row.create();
+
+                this.bindRow(row);
+
+                fragment.appendChild(row.render(true));
+
+                rows.push(row);
+                sections.push(row);
+            }
+
+            this.rows_box[0].appendChild(fragment);
+
+            Lampa.Layer.visible(scroll.render(true));
+        };
+
+        /**
+         * Навесить обработчики на полку.
+         * @param {object} row
+         */
+        this.bindRow = function(row){
+            row.onUp    = function(){ _self.up(); };
+            row.onDown  = function(){ _self.down(); };
+            row.onLeft  = function(){ Lampa.Controller.toggle('menu'); };
+            row.onBack  = function(){ _self.back(); };
+
+            row.onEnter = function(card){ openCard(card); };
+            row.onLong  = function(card){ cardMenu(card); };
+
+            row.onFocus = function(){ active = indexOfSection(row); };
+        };
+
+        /** Подгрузка следующей порции при достижении конца */
+        this.loadNext = function(){
+            if(next_wait || !built) return;
+
+            next_wait = true;
+
+            this.loadPart(function(data){
+                next_wait = false;
+
+                if(!_self.html) return;
+
+                _self.append(data);
+            }, function(){
+                next_wait = false;
+            });
+        };
+
+        /** Вниз по секциям */
+        this.down = function(){
+            if(active >= sections.length - 1){
+                this.loadNext();
+                return;
+            }
+
+            active++;
+
+            this.focusSection();
+        };
+
+        /** Вверх по секциям, с первой — на верхнюю панель */
+        this.up = function(){
+            if(active <= 0) return this.focusNav();
+
+            active--;
+
+            this.focusSection();
+        };
+
+        /** Фокус на верхнюю панель (или на шапку Lampa, если панель отключена) */
+        this.focusNav = function(){
+            if(nav){
+                scroll.reset();
+
+                return nav.toggle();
+            }
+
+            Lampa.Controller.toggle('head');
+        };
+
+        /** Передать фокус активной секции */
+        this.focusSection = function(){
+            var section = sections[active];
+
+            // Пустая вкладка: фокусировать нечего — отдаём управление панели
+            if(!section) return this.focusNav();
+
+            for(var i = 0; i < rows.length; i++){
+                if(rows[i] !== section) rows[i].blur();
+            }
+
+            // Прижимаем к верху: у полки есть «якорь» высотой навбара, поэтому
+            // заголовок не уезжает под панель, а баннер уходит из кадра целиком
+            scroll.update(section.render(true));
+
+            section.toggle();
+        };
+
+        /** Колесо мыши */
+        this.wheel = function(step){
+            if(step > 0) this.down();
+            else this.up();
+        };
+
+        this.back = function(){
+            Lampa.Activity.backward();
+        };
+
+        /** Старт активности */
+        this.start = function(){
+            $('body').addClass('nfx--home');
+            $('body').toggleClass('nfx--nav', !!nav);
+
+            if(billboard) billboard.rotate();
+
+            Lampa.Controller.add('content', {
+                link: this,
+                toggle: function(){
+                    scroll.restorePosition();
+
+                    _self.focusSection();
+                },
+                left: function(){
+                    if(Navigator.canmove('left')) Navigator.move('left');
+                    else Lampa.Controller.toggle('menu');
+                },
+                right: function(){
+                    Navigator.move('right');
+                },
+                up: function(){
+                    _self.up();
+                },
+                down: function(){
+                    _self.down();
+                },
+                back: function(){
+                    _self.back();
+                }
+            });
+
+            Lampa.Controller.toggle('content');
+        };
+
+        this.pause = function(){
+            $('body').removeClass('nfx--home nfx--nav');
+
+            trailerStop();
+
+            if(billboard) billboard.stop();
+        };
+
+        this.stop = function(){
+            $('body').removeClass('nfx--home nfx--nav');
+
+            trailerStop();
+
+            if(billboard) billboard.stop();
+        };
+
+        this.resize = function(){
+            if(sections[active]) scroll.update(sections[active].render(true));
+        };
+
+        this.render = function(js){
+            return js ? this.html[0] : this.html;
+        };
+
+        this.destroy = function(){
+            $('body').removeClass('nfx--home nfx--nav');
+
+            trailerStop();
+
+            token++;
+
+            apiClear();
+
+            if(nav) nav.destroy();
+            if(billboard) billboard.destroy();
+
+            for(var i = 0; i < rows.length; i++) rows[i].destroy();
+
+            rows     = [];
+            sections = [];
+            parts    = [];
+
+            scroll.destroy();
+
+            if(this.html) this.html.remove();
+
+            this.html = null;
+            nav       = null;
+            billboard = null;
+        };
+
+        /** Индекс секции */
+        function indexOfSection(section){
+            for(var i = 0; i < sections.length; i++){
+                if(sections[i] === section) return i;
+            }
+
+            return active;
+        }
+    }
+
+    /** Показывать верхнюю панель? */
+    function navEnabled(){
+        var value = pref('nfx_nav');
+
+        return value === true || value === 'true';
+    }
+
+    /** Показывать баннер? */
+    function showBillboard(){
+        var value = pref('nfx_billboard');
+
+        return value === true || value === 'true';
+    }
+
+    /** Показывать подписи под карточками? */
+    function showTitles(){
+        var value = pref('nfx_titles');
+
+        return value === true || value === 'true';
+    }
+
+    /**
+     * Контекстное меню карточки (длинное нажатие / OK-hold).
+     * @param {object} card
+     */
+    function cardMenu(card){
+        var enabled = Lampa.Controller.enabled().name;
+        var marks   = {};
+
+        try { marks = Lampa.Favorite.check(card) || {}; }
+        catch(e){}
+
+        var items = [
+            { title: tr('nfx_play'), action: 'play' },
+            { title: tr('nfx_info'), action: 'info' },
+            { title: (marks.book ? '- ' : '+ ') + tr('nfx_row_mylist'), action: 'book' }
+        ];
+
+        Lampa.Select.show({
+            title: Lampa.Lang.translate('title_action'),
+            items: items,
+            onSelect: function(item){
+                Lampa.Controller.toggle(enabled);
+
+                if(item.action === 'play') nfxAutoPlay(card);
+                if(item.action === 'info') openCard(card);
+
+                if(item.action === 'book'){
+                    Lampa.Favorite.toggle('book', card);
+                    Lampa.Noty.show(Lampa.Lang.translate('title_book') + ': ' + cardTitle(card));
+                }
+            },
+            onBack: function(){
+                Lampa.Controller.toggle(enabled);
+            }
+        });
+    }
+
+    /* ---------- src/settings.js ---------- */
+    /**
+     * Раздел настроек плагина.
+     */
+
+    /** Иконка раздела настроек — единственное место, где остался красный знак */
+    var NFX_ICON = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">' +
+        '<path d="M5 2h4.6l4.9 12.6V2H19v20h-4.6L9.5 9.2V22H5V2z" fill="#e50914"/></svg>';
+
+    /** Иконка пункта в боковом меню — нейтральная */
+    var NFX_MENU_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round">' +
+        '<rect x="3" y="4" width="7.5" height="16" rx="1.2"/>' +
+        '<rect x="13.5" y="4" width="7.5" height="7" rx="1.2"/>' +
+        '<rect x="13.5" y="13" width="7.5" height="7" rx="1.2"/></svg>';
+
+    function settingsInit(){
+        Lampa.SettingsApi.addComponent({
+            component: 'nfx',
+            name: tr('nfx_title'),
+            icon: NFX_ICON
+        });
+
+        param({ name: 'nfx_head_view', type: 'title' }, { name: tr('nfx_settings_descr') });
+
+        param(
+            { name: 'nfx_theme', type: 'trigger', default: true },
+            { name: tr('nfx_param_theme'), description: tr('nfx_param_theme_d') }
+        );
+
+        param(
+            { name: 'nfx_home', type: 'trigger', default: true },
+            { name: tr('nfx_param_home'), description: tr('nfx_param_home_d') }
+        );
+
+        param(
+            { name: 'nfx_nav', type: 'trigger', default: true },
+            { name: tr('nfx_param_nav'), description: tr('nfx_param_nav_d') }
+        );
+
+        param(
+            { name: 'nfx_billboard', type: 'trigger', default: true },
+            { name: tr('nfx_param_billboard'), description: tr('nfx_param_billboard_d') }
+        );
+
+        param(
+            {
+                name: 'nfx_rotate',
+                type: 'select',
+                default: '12',
+                values: {
+                    '0': Lampa.Lang.translate('settings_param_no'),
+                    '8': '8 ' + secLabel(),
+                    '12': '12 ' + secLabel(),
+                    '20': '20 ' + secLabel(),
+                    '40': '40 ' + secLabel()
+                }
+            },
+            { name: tr('nfx_param_rotate') }
+        );
+
+        param(
+            {
+                name: 'nfx_shape',
+                type: 'select',
+                default: 'expand',
+                values: {
+                    expand: tr('nfx_param_shape_exp'),
+                    wide: tr('nfx_param_shape_wide'),
+                    poster: tr('nfx_param_shape_post')
+                }
+            },
+            { name: tr('nfx_param_shape') }
+        );
+
+        param(
+            { name: 'nfx_pin', type: 'trigger', default: true },
+            { name: tr('nfx_param_pin'), description: tr('nfx_param_pin_d') }
+        );
+
+        param(
+            { name: 'nfx_titles', type: 'trigger', default: false },
+            { name: tr('nfx_param_titles') }
+        );
+
+        param(
+            {
+                name: 'nfx_font',
+                type: 'select',
+                default: 'golos-montserrat',
+                values: {
+                    'golos-montserrat': tr('nfx_font_gm'),
+                    'golos': tr('nfx_font_golos'),
+                    'manrope': tr('nfx_font_manrope'),
+                    'montserrat': tr('nfx_font_montserrat'),
+                    'inter': tr('nfx_font_inter'),
+                    'inter-montserrat': tr('nfx_font_im'),
+                    'custom': tr('nfx_font_custom'),
+                    'off': tr('nfx_font_system')
+                }
+            },
+            { name: tr('nfx_param_font'), description: tr('nfx_param_font_d') }
+        );
+
+        param(
+            { name: 'nfx_font_family', type: 'input', values: '', default: '', placeholder: 'Golos Sharp' },
+            { name: tr('nfx_param_font_fam'), description: tr('nfx_param_font_fam_d') }
+        );
+
+        param(
+            { name: 'nfx_font_css', type: 'input', values: '', default: '', placeholder: 'http://127.0.0.1:9118/golos-sharp.css' },
+            { name: tr('nfx_param_font_css'), description: tr('nfx_param_font_css_d') }
+        );
+
+        param(
+            {
+                name: 'nfx_trailer',
+                type: 'select',
+                default: '0',
+                values: {
+                    '0': Lampa.Lang.translate('settings_param_no'),
+                    '2': '2 ' + secLabel(),
+                    '3': '3 ' + secLabel(),
+                    '5': '5 ' + secLabel()
+                }
+            },
+            { name: tr('nfx_param_trailer'), description: tr('nfx_param_trailer_d') }
+        );
+
+        param(
+            { name: 'nfx_trailer_sound', type: 'trigger', default: false },
+            { name: tr('nfx_param_trailer_s'), description: tr('nfx_param_trailer_s_d') }
+        );
+
+        param(
+            { name: 'nfx_prefetch', type: 'trigger', default: true },
+            { name: tr('nfx_param_prefetch'), description: tr('nfx_param_prefetch_d') }
+        );
+
+        param(
+            { name: 'nfx_top10', type: 'trigger', default: true },
+            { name: tr('nfx_param_top10') }
+        );
+
+        param(
+            { name: 'nfx_lampac_rows', type: 'trigger', default: true },
+            { name: tr('nfx_param_lampac'), description: tr('nfx_param_lampac_d') }
+        );
+
+        param(
+            { name: 'nfx_host', type: 'input', values: '', default: '', placeholder: 'http://127.0.0.1:9118' },
+            { name: tr('nfx_param_host'), description: tr('nfx_param_host_d') }
+        );
+
+        param(
+            { name: 'nfx_open', type: 'button' },
+            { name: tr('nfx_param_open') },
+            function(){
+                Lampa.Settings.close();
+                openHome();
+            }
+        );
+    }
+
+    /**
+     * Короткая обёртка над SettingsApi.addParam.
+     * @param {object} p параметр
+     * @param {object} field подпись
+     * @param {function} onChange
+     */
+    function param(p, field, onChange){
+        var data = {
+            component: 'nfx',
+            param: p,
+            field: field
+        };
+
+        if(onChange) data.onChange = onChange;
+
+        Lampa.SettingsApi.addParam(data);
+    }
+
+    /** «сек» на языке интерфейса */
+    function secLabel(){
+        return Lampa.Lang.selected(['ru', 'uk', 'be', 'bg']) ? 'сек' : 'sec';
+    }
+
+    /** Открыть главную Netflix отдельной активностью */
+    function openHome(){
         Lampa.Activity.push({
-          url: '',
-          title: Lampa.Lang.translate('lampac_title_online'),
-          component: 'alcopac',
-          search: all[id] ? all[id] : e.movie.title,
-          search_one: e.movie.title,
-          search_two: e.movie.original_title,
-          movie: e.movie,
-          page: 1,
-		  clarification: all[id] ? true : false
+            url: '',
+            title: tr('nfx_title'),
+            component: 'nfx_main',
+            page: 1
         });
-      });
-      e.render.after(btn);
     }
-    Lampa.Listener.follow('full', function(e) {
-      if (e.type == 'complite') {
-        addButton({
-          render: e.object.activity.render().find('.view--torrent'),
-          movie: e.data.movie
-        });
-      }
-    });
-    try {
-      if (Lampa.Activity.active().component == 'full') {
-        addButton({
-          render: Lampa.Activity.active().activity.render().find('.view--torrent'),
-          movie: Lampa.Activity.active().card
-        });
-      }
-    } catch (e) {}
-    if (Lampa.Manifest.app_digital >= 177) {
-      var balansers_sync = ["filmix", 'filmixtv', "fxapi", "rezka", "rhsprem", "lumex", "videodb", "collaps", "collaps-dash", "hdvb", "zetflix", "kodik", "ashdi", "kinoukr", "kinotochka", "remux", "iframevideo", "cdnmovies", "anilibria", "animedia", "animego", "animevost", "animebesst", "redheadsound", "alloha", "animelib", "moonanime", "kinopub", "vibix", "vdbmovies", "fancdn", "cdnvideohub", "vokino", "rc/filmix", "rc/fxapi", "rc/rhs", "vcdn", "videocdn", "mirage", "hydraflix","videasy","vidsrc","movpi","vidlink","twoembed","autoembed","smashystream","autoembed","rgshows", "pidtor", "videoseed", "iptvonline", "veoveo"];
-      balansers_sync.forEach(function(name) {
-        Lampa.Storage.sync('online_choice_' + name, 'object_object');
-      });
-      Lampa.Storage.sync('online_watched_last', 'object_object');
-    }
-  }
-  if (!window.lampac_plugin) startPlugin();
 
+    /** Перестроить главную, если она сейчас открыта */
+    function refreshHome(){
+        var active = Lampa.Activity.active();
+
+        if(!active) return;
+
+        // 'main' тоже перерисовываем: при выключении подмены нужно вернуть штатный экран
+        if(active.component === 'nfx_main' || active.component === 'main'){
+            Lampa.Activity.replace();
+        }
+    }
+
+    /* ---------- src/menu.js ---------- */
+    /**
+     * Пункт «Netflix» в боковом меню.
+     */
+    function menuInit(){
+        addMenuItem();
+
+        // Меню может быть перерисовано (смена языка, редактор меню)
+        Lampa.Listener.follow('menu', function(e){
+            if(e.type === 'start') setTimeout(addMenuItem, 100);
+        });
+    }
+
+    /** Вставить пункт первым в списке меню */
+    function addMenuItem(){
+        var list = $('.menu .menu__list').eq(0);
+
+        if(!list.length) return;
+        if(list.find('[data-action="nfx"]').length) return;
+
+        var item = $(
+            '<li class="menu__item selector" data-action="nfx">' +
+                '<div class="menu__ico">' + NFX_MENU_ICON + '</div>' +
+                '<div class="menu__text">' + esc(tr('nfx_title')) + '</div>' +
+            '</li>'
+        );
+
+        item.on('hover:enter', function(){
+            openHome();
+        });
+
+        list.prepend(item);
+    }
+
+    /* ---------- src/start.js ---------- */
+    /**
+     * Точка входа: регистрация компонентов, темы, меню и настроек.
+     */
+
+    /** Оригинальный компонент главной страницы Lampa */
+    var nfx_main_original = null;
+
+    /** Включена ли подмена главной страницы */
+    function homeEnabled(){
+        var value = pref('nfx_home');
+
+        return value === true || value === 'true';
+    }
+
+    /** Подменить/вернуть штатный компонент 'main' */
+    function applyHome(){
+        if(homeEnabled()) Lampa.Component.add('main', NfxMain);
+        else if(nfx_main_original) Lampa.Component.add('main', nfx_main_original);
+    }
+
+    /** Настройки, требующие перерисовки главной */
+    var NFX_REFRESH_PARAMS = ['nfx_nav', 'nfx_billboard', 'nfx_rotate', 'nfx_shape', 'nfx_titles', 'nfx_top10', 'nfx_prefetch', 'nfx_pin', 'nfx_lampac_rows'];
+
+    /**
+     * Реакция на изменение настроек.
+     * Ловим через Storage, а не через onChange параметра — так работает
+     * и синхронизация аккаунта, и изменения из других плагинов.
+     */
+    function watchSettings(){
+        Lampa.Storage.listener.follow('change', function(e){
+            if(!e || ('' + e.name).indexOf('nfx_') !== 0) return;
+
+            if(e.name === 'nfx_theme') return themeToggle(e.value === true || e.value === 'true');
+
+            if(e.name === 'nfx_font' || e.name === 'nfx_font_family' || e.name === 'nfx_font_css') return fontApply();
+
+            if(e.name === 'nfx_home'){
+                applyHome();
+
+                return refreshHome();
+            }
+
+            if(e.name === 'nfx_host'){
+                detectHost();
+
+                return refreshHome();
+            }
+
+            // Трейлер не требует перерисовки — достаточно погасить текущий
+            if(e.name === 'nfx_trailer' || e.name === 'nfx_trailer_sound') return trailerStop();
+
+            if(indexOf(NFX_REFRESH_PARAMS, e.name) > -1) refreshHome();
+        });
+    }
+
+    /** Инициализация плагина */
+    function nfxStart(){
+        if(window.nfx_plugin_started) return;
+
+        window.nfx_plugin_started = true;
+
+        langInit();
+        settingsInit();
+        detectHost();
+        themeInit();
+        fontApply();
+        autoPlayInit();
+
+        nfx_main_original = Lampa.Component.get('main');
+
+        Lampa.Component.add('nfx_main', NfxMain);
+
+        applyHome();
+        menuInit();
+        watchSettings();
+
+        // Если главная уже открыта штатным компонентом — перерисовать её
+        var active = Lampa.Activity.active();
+
+        if(homeEnabled() && active && active.component === 'main'){
+            Lampa.Activity.replace();
+        }
+
+        // Точка для отладки: window.nfx_trailer_state()
+        window.nfx_trailer_state = trailerState;
+
+        console.log('NetflixUI', 'started v' + NFX.version, 'lampac host:', NFX.host || '(не найден)');
+    }
+
+    /** Дождаться готовности Lampa и запуститься */
+    function nfxBoot(){
+        if(typeof Lampa === 'undefined'){
+            var timer = setInterval(function(){
+                if(typeof Lampa === 'undefined') return;
+
+                clearInterval(timer);
+                nfxBoot();
+            }, 200);
+
+            return;
+        }
+
+        if(window.appready) nfxStart();
+        else {
+            Lampa.Listener.follow('app', function(e){
+                if(e.type === 'ready') nfxStart();
+            });
+        }
+    }
+
+    nfxBoot();
 })();
